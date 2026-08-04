@@ -13,4 +13,6 @@ coverage.xml
 htmlcov/
 dist/
 build/
+data/*.db
+data/*.db-*
 .DS_Store

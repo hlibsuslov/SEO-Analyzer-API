@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import httpx
 from conftest import OPTIMIZED_HTML, make_fetcher, make_settings
@@ -8,8 +9,18 @@ from seo_analyzer.analyzer import Analyzer
 from seo_analyzer.api import create_app
 
 
-def build_client(*, api_key: str | None = None, cors: str = "") -> tuple[TestClient, Analyzer]:
-    settings = make_settings(api_key=api_key, cors_origins=cors, cache_ttl_seconds=60)
+def build_client(
+    *,
+    api_key: str | None = None,
+    cors: str = "",
+    scan_storage_path: str | None = None,
+) -> tuple[TestClient, Analyzer]:
+    settings = make_settings(
+        api_key=api_key,
+        cors_origins=cors,
+        cache_ttl_seconds=60,
+        **({"scan_storage_path": scan_storage_path} if scan_storage_path else {}),
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path in {"/robots.txt", "/sitemap.xml"}:
@@ -187,5 +198,43 @@ def test_configured_cors_preflight() -> None:
             )
             assert response.status_code == 200
             assert response.headers["access-control-allow-origin"] == ("https://dashboard.test")
+    finally:
+        close_analyzer(analyzer)
+
+
+def test_unified_link_graph_scan_endpoints(tmp_path) -> None:
+    client, analyzer = build_client(scan_storage_path=str(tmp_path / "scans.db"))
+    try:
+        with client:
+            project = client.post("/api/projects", json={"url": "https://saas.test"}).json()
+            scan = client.post(
+                f"/api/projects/{project['id']}/scans",
+                json={"max_pages": 3, "max_depth": 1, "concurrency": 2, "respect_robots": False},
+            ).json()
+            status = {}
+            for _ in range(30):
+                time.sleep(0.05)
+                status = client.get(f"/api/scans/{scan['id']}/status").json()
+                if status["status"] in {"completed", "failed", "cancelled"}:
+                    break
+            assert status["status"] == "completed"
+
+            stats = client.get(f"/api/scans/{scan['id']}/stats").json()
+            assert stats["total_pages"] >= 1
+            assert stats["total_internal_links"] >= 1
+
+            graph = client.get(f"/api/scans/{scan['id']}/graph").json()
+            assert graph["nodes"]
+            assert any(node["seo_score"] is not None for node in graph["nodes"])
+
+            pages = client.get(f"/api/scans/{scan['id']}/pages").json()
+            assert pages[0]["graph_node_id"]
+            node_detail = client.get(f"/api/scans/{scan['id']}/pages/{pages[0]['graph_node_id']}")
+            assert node_detail.status_code == 200
+
+            assert client.get(f"/api/scans/{scan['id']}/seo/issues").status_code == 200
+            dashboard = client.get(f"/api/scans/{scan['id']}/dashboard")
+            assert dashboard.status_code == 200
+            assert "Link Graph" in dashboard.text
     finally:
         close_analyzer(analyzer)

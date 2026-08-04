@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(default=300, ge=0, le=86_400)
     cache_max_entries: int = Field(default=512, ge=1, le=10_000)
     max_site_pages: int = Field(default=100, ge=1, le=1_000)
+    scan_storage_path: str = "data/analyzer.db"
+    scan_job_workers: int = Field(default=2, ge=1, le=16)
 
     enable_pagespeed: bool = False
     pagespeed_api_key: SecretStr | None = None

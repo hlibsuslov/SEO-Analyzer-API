@@ -11,6 +11,7 @@ This fork is a ground-up v2 implementation of [KovalDenys1/SEO-Analyzer-API](htt
 - Scores **core SEO health separately from SaaS acquisition/conversion readiness**.
 - Produces evidence-backed issues and ranked recommendations with impact, effort, confidence, validation, and affected pages.
 - Crawls a bounded site sample while respecting `robots.txt`, discovering XML sitemap indexes, and detecting sampled broken links, exact duplicates, weak internal linking, and potential orphan pages.
+- Runs persistent unified link-graph scans: one bounded crawl builds internal/external link graph data and attaches SEO results to every graph node.
 - Assesses seven SaaS strategy pillars: commercial foundation, audience/use cases, product-led acquisition, bottom-funnel evaluation, authority, trust, and product enablement.
 - Compares up to eight pages without mislabeling the result as a Google ranking.
 - Ranks supplied Search Console/conversion rows by traffic and revenue opportunity without inventing external keyword or SERP data.
@@ -40,6 +41,11 @@ Private-network access can be enabled for a trusted internal deployment, but it 
 | `POST` | `/v1/site-audit` | Bounded robots-aware crawl and SaaS strategy assessment |
 | `POST` | `/v1/compare` | Relative SEO/SaaS comparison for 2–8 pages |
 | `POST` | `/v1/opportunities` | First-party traffic/revenue opportunity ranking |
+| `GET` | `/app` | Minimal browser UI for unified link-graph scans |
+| `POST` | `/api/projects` | Create a persistent crawl project |
+| `POST` | `/api/projects/{project_id}/scans` | Start a background crawl + graph + SEO scan |
+| `GET` | `/api/scans/{scan_id}/graph` | Graph nodes/edges with SEO data attached |
+| `GET` | `/api/scans/{scan_id}/dashboard` | Interactive graph dashboard for a completed scan |
 | `GET` | `/analyze` | Backwards-compatible original full-analysis shape plus `v2` data |
 | `GET` | `/quick-score` | Score, warnings, and top recommendations |
 | `GET` | `/metadata` | Metadata, headings, social, and canonical data |
@@ -80,6 +86,23 @@ curl http://127.0.0.1:8000/v1/site-audit \
   }'
 ```
 
+Run a persistent link-graph scan:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/projects \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","name":"Example"}'
+
+curl -X POST http://127.0.0.1:8000/api/projects/{project_id}/scans \
+  -H 'Content-Type: application/json' \
+  -d '{"max_pages":50,"max_depth":4,"concurrency":4,"respect_robots":true}'
+
+curl http://127.0.0.1:8000/api/scans/{scan_id}/status
+curl http://127.0.0.1:8000/api/scans/{scan_id}/graph
+```
+
+The browser workflow is available at `http://127.0.0.1:8000/app`.
+
 If `SEO_API_KEY` is set, add `-H 'X-API-Key: …'` to protected endpoints.
 
 ## Docker
@@ -105,6 +128,8 @@ All settings use the `SEO_` prefix. See [`.env.example`](.env.example) for the c
 | `SEO_ALLOW_PRIVATE_HOSTS` | `false` | Permit non-public targets; trusted deployments only |
 | `SEO_CACHE_TTL_SECONDS` | `300` | Analysis cache TTL; `0` disables cache |
 | `SEO_MAX_SITE_PAGES` | `100` | Server-side hard cap for a site audit |
+| `SEO_SCAN_STORAGE_PATH` | `data/analyzer.db` | SQLite storage for persistent link-graph scans |
+| `SEO_SCAN_JOB_WORKERS` | `2` | Reserved scan worker budget for deployments |
 | `SEO_ENABLE_PAGESPEED` | `false` | Permit quota-consuming PageSpeed calls |
 | `SEO_PAGESPEED_API_KEY` | empty | Optional Google API key |
 | `SEO_CORS_ORIGINS` | empty | Comma-separated browser origins |

@@ -11,20 +11,25 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
 from prometheus_client import Counter as PrometheusCounter
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from seo_analyzer import __version__
 from seo_analyzer.analyzer import Analyzer
 from seo_analyzer.config import Settings, get_settings
 from seo_analyzer.crawler import SiteCrawler
+from seo_analyzer.dashboard import render_dashboard
 from seo_analyzer.fetcher import FetchError
+from seo_analyzer.frontend import APP_HTML
+from seo_analyzer.jobs import UnifiedScanManager
+from seo_analyzer.link_graph import UnifiedCrawlOptions, build_graph
 from seo_analyzer.models import CompareRequest, OpportunityRequest, PageAnalysis, SiteAuditRequest
 from seo_analyzer.opportunity import rank_opportunities
-from seo_analyzer.utils import utc_now_iso
+from seo_analyzer.storage import ScanStorage
+from seo_analyzer.utils import normalize_url, utc_now_iso
 
 LOGGER = logging.getLogger("seo_analyzer.api")
 REQUESTS = PrometheusCounter(
@@ -91,6 +96,21 @@ class RequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
+class ProjectCreate(BaseModel):
+    url: str = Field(min_length=4, max_length=2_048)
+    name: str | None = Field(default=None, max_length=200)
+
+
+class ScanCreate(BaseModel):
+    url: str | None = Field(default=None, min_length=4, max_length=2_048)
+    max_pages: int = Field(default=100, ge=1, le=1_000)
+    max_depth: int = Field(default=5, ge=0, le=25)
+    concurrency: int = Field(default=4, ge=1, le=16)
+    respect_robots: bool = True
+    include_subdomains: bool = False
+    include_query_parameters: bool = False
+
+
 def create_app(settings: Settings | None = None, analyzer: Analyzer | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
     owns_analyzer = analyzer is None
@@ -104,6 +124,11 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
         app.state.settings = runtime_settings
         app.state.analyzer = analyzer or Analyzer(runtime_settings)
         app.state.crawler = SiteCrawler(app.state.analyzer)
+        app.state.scan_storage = ScanStorage(runtime_settings.scan_storage_path)
+        app.state.scan_manager = UnifiedScanManager(
+            app.state.scan_storage,
+            app.state.analyzer,
+        )
         yield
         if owns_analyzer:
             await app.state.analyzer.close()
@@ -211,6 +236,12 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
 
     def get_crawler(request: Request) -> SiteCrawler:
         return request.app.state.crawler
+
+    def get_scan_storage(request: Request) -> ScanStorage:
+        return request.app.state.scan_storage
+
+    def get_scan_manager(request: Request) -> UnifiedScanManager:
+        return request.app.state.scan_manager
 
     @app.get("/", tags=["operations"])
     async def root() -> dict[str, Any]:
@@ -381,6 +412,272 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
             "social": report.social,
         }
 
+    @app.get("/app", response_class=HTMLResponse, tags=["link-graph"])
+    async def graph_app() -> HTMLResponse:
+        return HTMLResponse(APP_HTML)
+
+    @app.get("/api/health", tags=["link-graph"])
+    async def graph_health(
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        return {"status": "ok", "storage": str(storage.path)}
+
+    @app.post(
+        "/api/projects",
+        status_code=201,
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def create_project(
+        payload: ProjectCreate,
+        current: Analyzer = Depends(get_analyzer),
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        root_url = await _validated_scan_url(current, payload.url)
+        return storage.create_project(root_url, payload.name)
+
+    @app.get(
+        "/api/projects",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def list_projects(
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> list[dict[str, Any]]:
+        return storage.list_projects()
+
+    @app.get(
+        "/api/projects/{project_id}",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def get_project(
+        project_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        project = storage.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return project
+
+    @app.post(
+        "/api/projects/{project_id}/scans",
+        status_code=202,
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def start_scan(
+        project_id: str,
+        payload: ScanCreate,
+        current: Analyzer = Depends(get_analyzer),
+        storage: ScanStorage = Depends(get_scan_storage),
+        manager: UnifiedScanManager = Depends(get_scan_manager),
+    ) -> dict[str, Any]:
+        project = storage.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        start_url = await _validated_scan_url(current, payload.url or project["root_url"])
+        options = UnifiedCrawlOptions(
+            max_pages=payload.max_pages,
+            max_depth=payload.max_depth,
+            concurrency=payload.concurrency,
+            respect_robots=payload.respect_robots,
+            include_subdomains=payload.include_subdomains,
+            include_query_parameters=payload.include_query_parameters,
+        )
+        return manager.create_and_start(project_id, start_url, options)
+
+    @app.get(
+        "/api/projects/{project_id}/scans",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def list_project_scans(
+        project_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> list[dict[str, Any]]:
+        if not storage.get_project(project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
+        return storage.list_scans(project_id)
+
+    @app.get(
+        "/api/scans/{scan_id}/status",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_status(
+        scan_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        return _require_scan(scan_id, storage)
+
+    @app.post(
+        "/api/scans/{scan_id}/cancel",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def cancel_scan(
+        scan_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+        manager: UnifiedScanManager = Depends(get_scan_manager),
+    ) -> dict[str, bool]:
+        _require_scan(scan_id, storage)
+        return {"cancelled": manager.cancel(scan_id)}
+
+    @app.post(
+        "/api/scans/{scan_id}/rerun",
+        status_code=202,
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def rerun_scan(
+        scan_id: str,
+        manager: UnifiedScanManager = Depends(get_scan_manager),
+    ) -> dict[str, Any]:
+        try:
+            return manager.rerun(scan_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Scan not found") from None
+
+    @app.get(
+        "/api/scans/{scan_id}/pages",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_pages(
+        scan_id: str,
+        include_redirects: bool = False,
+        status: int | None = None,
+        max_depth: int | None = None,
+        issue: str | None = None,
+        min_score: float | None = None,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> list[dict[str, Any]]:
+        _require_scan(scan_id, storage)
+        pages = storage.list_pages(scan_id, include_redirects=include_redirects)
+        return _filter_pages(
+            pages,
+            status=status,
+            max_depth=max_depth,
+            issue=issue,
+            min_score=min_score,
+        )
+
+    @app.get(
+        "/api/scans/{scan_id}/page",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_page_by_url(
+        scan_id: str,
+        url: str = Query(min_length=4, max_length=2_048),
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        _require_scan(scan_id, storage)
+        page = storage.get_page_by_url(scan_id, normalize_url(url, keep_query=True))
+        if not page:
+            raise HTTPException(status_code=404, detail="Page not found")
+        return page
+
+    @app.get(
+        "/api/scans/{scan_id}/pages/{graph_node_id}",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_page_by_node(
+        scan_id: str,
+        graph_node_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        _require_scan(scan_id, storage)
+        page = storage.get_page_by_node_id(scan_id, graph_node_id)
+        if not page:
+            raise HTTPException(status_code=404, detail="Page not found")
+        return page
+
+    @app.get(
+        "/api/scans/{scan_id}/links",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_links(
+        scan_id: str,
+        type: str | None = Query(default=None, pattern="^(internal|external)$"),
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> list[dict[str, Any]]:
+        _require_scan(scan_id, storage)
+        return storage.list_links(scan_id, type)
+
+    @app.get(
+        "/api/scans/{scan_id}/graph",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_graph(
+        scan_id: str,
+        status: int | None = None,
+        max_depth: int | None = None,
+        issue: str | None = None,
+        min_score: float | None = None,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        result = _require_result(scan_id, storage)
+        if any(value is not None for value in (status, max_depth, issue, min_score)):
+            pages = _filter_pages(
+                list(result["crawl"]["pages"].values()),
+                status=status,
+                max_depth=max_depth,
+                issue=issue,
+                min_score=min_score,
+            )
+            allowed = {page["url"] for page in pages}
+            filtered_crawl = {
+                **result["crawl"],
+                "pages": {
+                    url: page for url, page in result["crawl"]["pages"].items() if url in allowed
+                },
+            }
+            return build_graph(filtered_crawl)
+        return result["graph"]
+
+    @app.get(
+        "/api/scans/{scan_id}/seo/issues",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_issues(
+        scan_id: str,
+        severity: str | None = None,
+        code: str | None = None,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> list[dict[str, Any]]:
+        _require_scan(scan_id, storage)
+        issues = storage.list_issues(scan_id, severity=severity)
+        return [item for item in issues if item.get("code") == code] if code else issues
+
+    @app.get(
+        "/api/scans/{scan_id}/stats",
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_stats(
+        scan_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> dict[str, Any]:
+        return _require_result(scan_id, storage)["stats"]
+
+    @app.get(
+        "/api/scans/{scan_id}/dashboard",
+        response_class=HTMLResponse,
+        tags=["link-graph"],
+        dependencies=[Depends(require_api_key)],
+    )
+    async def scan_dashboard(
+        scan_id: str,
+        storage: ScanStorage = Depends(get_scan_storage),
+    ) -> HTMLResponse:
+        return HTMLResponse(render_dashboard(_require_result(scan_id, storage)))
+
     return app
 
 
@@ -417,6 +714,51 @@ def _legacy_payload(report: Any) -> dict[str, Any]:
         "seo_grade": report.score.grade,
         "v2": report.model_dump(mode="json"),
     }
+
+
+async def _validated_scan_url(analyzer: Analyzer, url: str) -> str:
+    parsed, _ = await analyzer.fetcher.validate(url)
+    return normalize_url(str(parsed), keep_query=True)
+
+
+def _require_scan(scan_id: str, storage: ScanStorage) -> dict[str, Any]:
+    scan = storage.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return scan
+
+
+def _require_result(scan_id: str, storage: ScanStorage) -> dict[str, Any]:
+    scan = _require_scan(scan_id, storage)
+    result = storage.get_result(scan_id)
+    if result is None:
+        raise HTTPException(status_code=409, detail=f"Scan is not complete: {scan['status']}")
+    return result
+
+
+def _filter_pages(
+    pages: list[dict[str, Any]],
+    *,
+    status: int | None = None,
+    max_depth: int | None = None,
+    issue: str | None = None,
+    min_score: float | None = None,
+) -> list[dict[str, Any]]:
+    filtered = []
+    for page in pages:
+        if page.get("redirected_to"):
+            continue
+        if status is not None and int(page.get("status") or 0) != status:
+            continue
+        if max_depth is not None and int(page.get("depth") or 0) > max_depth:
+            continue
+        seo = page.get("seo") or {}
+        if min_score is not None and float(seo.get("score") or 0) < min_score:
+            continue
+        if issue and not any(item.get("code") == issue for item in seo.get("issues") or []):
+            continue
+        filtered.append(page)
+    return filtered
 
 
 try:
