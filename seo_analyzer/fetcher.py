@@ -17,11 +17,19 @@ Resolver: TypeAlias = Callable[[str, int], Awaitable[list[IPAddress]]]
 
 
 class FetchError(Exception):
-    def __init__(self, code: str, message: str, *, status_code: int = 422) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 422,
+        upstream_status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.upstream_status_code = upstream_status_code
 
 
 @dataclass(slots=True)
@@ -201,6 +209,7 @@ class SafeFetcher:
                     "response_too_large",
                     f"Response exceeds the {max_bytes}-byte limit",
                     status_code=413,
+                    upstream_status_code=response.status_code,
                 )
             body = bytearray()
             async for chunk in response.aiter_bytes():
@@ -210,6 +219,7 @@ class SafeFetcher:
                         "response_too_large",
                         f"Decompressed response exceeds the {max_bytes}-byte limit",
                         status_code=413,
+                        upstream_status_code=response.status_code,
                     )
         finally:
             await response.aclose()
@@ -244,6 +254,7 @@ class SafeFetcher:
                 "unsupported_content_type",
                 f"Expected {', '.join(accepted_content_types)} but received {value}",
                 status_code=415,
+                upstream_status_code=result.status_code,
             )
 
     @staticmethod

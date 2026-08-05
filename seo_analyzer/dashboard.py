@@ -4,7 +4,7 @@ from typing import Any
 
 
 def render_dashboard(result: dict[str, Any]) -> str:
-    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    payload = _json_for_inline_script(result)
     root = html.escape(result.get("stats", {}).get("root_domain", "site"))
     return f"""<!doctype html>
 <html lang="en">
@@ -48,6 +48,9 @@ def render_dashboard(result: dict[str, Any]) -> str:
     .critical, .high {{ border-color: #b42318; }}
     .medium {{ border-color: #b54708; }}
     .low, .info {{ border-color: #667085; }}
+    .filters {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
+    .zones {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
+    .zones label {{ display: flex; align-items: center; gap: 4px; margin: 0; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 8px; border-bottom: 1px solid #e7ecf3; text-align: left; vertical-align: top; }}
     th {{ font-size: 12px; color: #5f6d7e; }}
@@ -69,10 +72,20 @@ def render_dashboard(result: dict[str, Any]) -> str:
         <div class="metric"><b id="m-broken">0</b>Broken</div>
       </div>
       <div class="panel">
-        <label>Status <select id="status"><option value="">Any</option><option>200</option><option>404</option><option>500</option></select></label>
-        <label>Max depth <input id="depth" type="number" min="0" placeholder="Any"></label>
-        <label>Min SEO score <input id="score" type="number" min="0" max="100" placeholder="Any"></label>
-        <label>Issue code <input id="issue" placeholder="title_duplicate"></label>
+        <div class="filters">
+          <label>Status <select id="status"><option value="">Any</option><option>200</option><option>301</option><option>302</option><option>404</option><option>500</option><option value="0">No response</option></select></label>
+          <label>Max depth <input id="depth" type="number" min="0" placeholder="Any"></label>
+          <label>Min SEO score <input id="score" type="number" min="0" max="100" placeholder="Any"></label>
+          <label>Issue code <input id="issue" placeholder="title_duplicate"></label>
+        </div>
+        <div class="zones">
+          <label><input class="zone" type="checkbox" value="header" checked>Header</label>
+          <label><input class="zone" type="checkbox" value="nav" checked>Nav</label>
+          <label><input class="zone" type="checkbox" value="content" checked>Content</label>
+          <label><input class="zone" type="checkbox" value="footer" checked>Footer</label>
+          <label><input class="zone" type="checkbox" value="redirect" checked>Redirects</label>
+          <label><input id="external" type="checkbox">External domains</label>
+        </div>
       </div>
       <div id="detail" class="panel">Select a node.</div>
       <div class="panel"><table><thead><tr><th>Status</th><th>Score</th><th>URL</th></tr></thead><tbody id="pages"></tbody></table></div>
@@ -88,7 +101,8 @@ def render_dashboard(result: dict[str, Any]) -> str:
     document.getElementById('m-broken').textContent = (stats.broken_pages || []).length;
     const pagesByUrl = RESULT.crawl.pages || {{}};
     const svg = document.getElementById('graph');
-    const controls = ['status', 'depth', 'score', 'issue'].map(id => document.getElementById(id));
+    const controls = ['status', 'depth', 'score', 'issue', 'external'].map(id => document.getElementById(id));
+    controls.push(...document.querySelectorAll('.zone'));
     controls.forEach(el => el.addEventListener('input', render));
 
     function filteredNodes() {{
@@ -108,15 +122,30 @@ def render_dashboard(result: dict[str, Any]) -> str:
     }}
 
     function render() {{
-      const nodes = filteredNodes();
+      const pageNodes = filteredNodes();
+      const zones = new Set([...document.querySelectorAll('.zone:checked')].map(el => el.value));
+      const showExternal = document.getElementById('external').checked;
+      const nodes = [...pageNodes];
       const allowed = new Set(nodes.map(n => n.id));
-      const edges = graph.edges.filter(e => allowed.has(e.source) && allowed.has(e.target));
+      const edges = graph.edges.filter(e => allowed.has(e.source) && allowed.has(e.target) && (e.zones || ['content']).some(z => zones.has(z)));
+      if (showExternal) {{
+        const domains = new Map();
+        for (const edge of graph.external_edges || []) {{
+          if (!allowed.has(edge.source) || !(edge.zones || ['content']).some(z => zones.has(z))) continue;
+          const id = `external:${{edge.target_domain}}`;
+          if (!domains.has(id)) {{
+            const node = {{id, url: edge.target_url, label: edge.target_domain, external: true, seo_score: null, status: null}};
+            domains.set(id, node); nodes.push(node);
+          }}
+          edges.push({{...edge, target: id}});
+        }}
+      }}
       const w = svg.clientWidth || 900, h = svg.clientHeight || 620;
       const cx = w / 2, cy = h / 2, r = Math.max(120, Math.min(w, h) / 2 - 70);
       nodes.forEach((n, i) => {{
         const a = (Math.PI * 2 * i) / Math.max(nodes.length, 1);
-        n.x = cx + Math.cos(a) * r;
-        n.y = cy + Math.sin(a) * r;
+        n.x = nodes.length === 1 ? cx : cx + Math.cos(a) * r;
+        n.y = nodes.length === 1 ? cy : cy + Math.sin(a) * r;
       }});
       const byId = new Map(nodes.map(n => [n.id, n]));
       svg.innerHTML = '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#9aa8bb"/></marker></defs>';
@@ -126,17 +155,21 @@ def render_dashboard(result: dict[str, Any]) -> str:
         svg.insertAdjacentHTML('beforeend', `<line class="edge" x1="${{s.x}}" y1="${{s.y}}" x2="${{t.x}}" y2="${{t.y}}"/>`);
       }}
       for (const n of nodes) {{
-        const color = n.status >= 400 || n.status === 0 ? '#d92d20' : (n.seo_score < 75 ? '#f79009' : '#0f766e');
+        const color = n.external ? '#7f56d9' : (n.status >= 400 || n.status === 0 ? '#d92d20' : (n.status >= 300 || n.seo_score < 75 ? '#f79009' : '#0f766e'));
         const size = Math.max(7, Math.min(18, Number(n.seo_score || 50) / 6));
         svg.insertAdjacentHTML('beforeend', `<circle class="node" data-id="${{esc(n.id)}}" cx="${{n.x}}" cy="${{n.y}}" r="${{size}}" fill="${{color}}"><title>${{esc(n.url)}} · SEO ${{n.seo_score}}</title></circle>`);
         svg.insertAdjacentHTML('beforeend', `<text class="label" x="${{n.x + size + 4}}" y="${{n.y + 4}}">${{esc(short(n.url))}}</text>`);
       }}
       svg.querySelectorAll('.node').forEach(node => node.addEventListener('click', () => showDetail(byId.get(node.dataset.id))));
-      document.getElementById('pages').innerHTML = nodes.map(n => `<tr><td>${{n.status || ''}}</td><td>${{n.seo_score ?? ''}}</td><td class="url">${{esc(n.url)}}</td></tr>`).join('');
+      document.getElementById('pages').innerHTML = pageNodes.map(n => `<tr><td>${{n.status ?? ''}}</td><td>${{n.seo_score ?? ''}}</td><td class="url">${{esc(n.url)}}</td></tr>`).join('');
     }}
 
     function showDetail(n) {{
       if (!n) return;
+      if (n.external) {{
+        document.getElementById('detail').innerHTML = `<h2>${{esc(n.label)}}</h2><p class="url">External domain</p>`;
+        return;
+      }}
       const p = pagesByUrl[n.url] || {{}};
       const seo = p.seo || {{}};
       const issues = seo.issues || [];
@@ -155,3 +188,16 @@ def render_dashboard(result: dict[str, Any]) -> str:
   </script>
 </body>
 </html>"""
+
+
+def _json_for_inline_script(value: dict[str, Any]) -> str:
+    """Serialize untrusted crawl data without allowing a script-tag breakout."""
+
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )

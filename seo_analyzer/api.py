@@ -109,6 +109,7 @@ class ScanCreate(BaseModel):
     respect_robots: bool = True
     include_subdomains: bool = False
     include_query_parameters: bool = False
+    use_sitemap: bool = True
 
 
 def create_app(settings: Settings | None = None, analyzer: Analyzer | None = None) -> FastAPI:
@@ -129,9 +130,14 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
             app.state.scan_storage,
             app.state.analyzer,
         )
-        yield
-        if owns_analyzer:
-            await app.state.analyzer.close()
+        await app.state.scan_manager.startup()
+        try:
+            yield
+        finally:
+            await app.state.scan_manager.shutdown()
+            app.state.scan_storage.close()
+            if owns_analyzer:
+                await app.state.analyzer.close()
 
     app = FastAPI(
         title="SaaS SEO Analyzer API",
@@ -484,6 +490,7 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
             respect_robots=payload.respect_robots,
             include_subdomains=payload.include_subdomains,
             include_query_parameters=payload.include_query_parameters,
+            use_sitemap=payload.use_sitemap,
         )
         return manager.create_and_start(project_id, start_url, options)
 
@@ -557,6 +564,7 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
         pages = storage.list_pages(scan_id, include_redirects=include_redirects)
         return _filter_pages(
             pages,
+            include_redirects=include_redirects,
             status=status,
             max_depth=max_depth,
             issue=issue,
@@ -573,8 +581,14 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
         url: str = Query(min_length=4, max_length=2_048),
         storage: ScanStorage = Depends(get_scan_storage),
     ) -> dict[str, Any]:
-        _require_scan(scan_id, storage)
-        page = storage.get_page_by_url(scan_id, normalize_url(url, keep_query=True))
+        scan = _require_scan(scan_id, storage)
+        page = storage.get_page_by_url(
+            scan_id,
+            normalize_url(
+                url,
+                keep_query=bool(scan["options"].get("include_query_parameters", False)),
+            ),
+        )
         if not page:
             raise HTTPException(status_code=404, detail="Page not found")
         return page
@@ -602,7 +616,7 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
     )
     async def scan_links(
         scan_id: str,
-        type: str | None = Query(default=None, pattern="^(internal|external)$"),
+        type: str | None = Query(default=None, pattern="^(internal|external|redirect)$"),
         storage: ScanStorage = Depends(get_scan_storage),
     ) -> list[dict[str, Any]]:
         _require_scan(scan_id, storage)
@@ -625,6 +639,7 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
         if any(value is not None for value in (status, max_depth, issue, min_score)):
             pages = _filter_pages(
                 list(result["crawl"]["pages"].values()),
+                include_redirects=True,
                 status=status,
                 max_depth=max_depth,
                 issue=issue,
@@ -739,6 +754,7 @@ def _require_result(scan_id: str, storage: ScanStorage) -> dict[str, Any]:
 def _filter_pages(
     pages: list[dict[str, Any]],
     *,
+    include_redirects: bool = False,
     status: int | None = None,
     max_depth: int | None = None,
     issue: str | None = None,
@@ -746,11 +762,11 @@ def _filter_pages(
 ) -> list[dict[str, Any]]:
     filtered = []
     for page in pages:
-        if page.get("redirected_to"):
+        if page.get("redirected_to") and not include_redirects:
             continue
         if status is not None and int(page.get("status") or 0) != status:
             continue
-        if max_depth is not None and int(page.get("depth") or 0) > max_depth:
+        if max_depth is not None and (page.get("depth") is None or int(page["depth"]) > max_depth):
             continue
         seo = page.get("seo") or {}
         if min_score is not None and float(seo.get("score") or 0) < min_score:

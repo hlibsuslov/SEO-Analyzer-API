@@ -9,6 +9,9 @@ adds persistent link-graph scans on top of the existing safe asynchronous
 - The existing `SafeFetcher` remains the only network layer. The graph scan does
   not add a second crawler with `requests`, so SSRF protections, DNS validation,
   redirect validation, response budgets, and concurrency limits remain intact.
+- `/v1/site-audit` and persistent graph scans share `SiteCrawler.crawl`, including
+  robots handling, sitemap discovery, URL normalization, redirect deduplication,
+  and page/depth/concurrency budgets.
 - Each fetched HTML page is analyzed once by `Analyzer.analyze_artifact`. The
   resulting parsed links and SEO report are reused for graph nodes, edges, page
   details, issue lists, stats, and the dashboard.
@@ -23,13 +26,15 @@ adds persistent link-graph scans on top of the existing safe asynchronous
 - `seo_analyzer.link_graph`: async BFS graph scan, page normalization, graph
   stats, cycles, duplicates, redirects, and SEO-to-node mapping.
 - `seo_analyzer.storage`: SQLite persistence.
-- `seo_analyzer.jobs`: background scan tasks, progress, cancellation, and rerun.
+- `seo_analyzer.jobs`: bounded background scans, SQLite worker leases, heartbeat,
+  cross-worker cancellation, automatic recovery, and rerun.
 - `seo_analyzer.dashboard`: completed-scan graph dashboard renderer.
 - `seo_analyzer.frontend`: minimal browser UI for starting scans.
 
 ## Limitations
 
-- Jobs are in-process and are not resumed after an API process restart.
+- Active work is executed in-process. Graceful shutdown immediately requeues it;
+  process crashes are recovered after `SEO_SCAN_JOB_LEASE_SECONDS`.
 - External links are collected and visualized, but external targets are not fully
   crawled.
 - The dashboard is intentionally dependency-free and compact; deeper graph

@@ -4,6 +4,7 @@ import io
 import re
 import urllib.robotparser
 from collections import Counter, defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin
@@ -14,7 +15,14 @@ from seo_analyzer.analyzer import AnalysisArtifact, Analyzer
 from seo_analyzer.fetcher import FetchError, SafeFetcher
 from seo_analyzer.models import PageType, Severity, SiteAuditRequest
 from seo_analyzer.saas import assess_site_strategy, classify_path
-from seo_analyzer.utils import grade_for, normalize_url, origin_for, same_site, utc_now_iso
+from seo_analyzer.utils import (
+    grade_for,
+    is_html_like_url,
+    normalize_url,
+    origin_for,
+    same_site,
+    utc_now_iso,
+)
 
 
 @dataclass(slots=True)
@@ -54,17 +62,86 @@ class CrawlRecord:
     source: str
 
 
+@dataclass(slots=True)
+class SiteCrawlRequest:
+    url: str
+    max_pages: int
+    max_depth: int
+    concurrency: int
+    respect_robots: bool
+    include_subdomains: bool
+    include_query_parameters: bool
+    use_sitemap: bool
+
+    @classmethod
+    def from_api_request(cls, request: SiteAuditRequest) -> "SiteCrawlRequest":
+        return cls(**request.model_dump())
+
+
+@dataclass(slots=True)
+class SiteCrawlSnapshot:
+    request: SiteCrawlRequest
+    start_url: str
+    origin: str
+    robots: RobotsSnapshot
+    sitemap: dict[str, Any]
+    crawled: dict[str, CrawlRecord]
+    failures: list[dict[str, Any]]
+    blocked: list[str]
+    out_of_scope_redirects: list[dict[str, Any]]
+    discovered: set[str]
+    inlinks: Counter[str]
+    source_links: dict[str, list[str]]
+    redirects: dict[str, dict[str, Any]]
+    url_context: dict[str, dict[str, Any]]
+    queued_remaining: int
+    processed_urls: int
+    effective_max_pages: int
+
+
+class SiteCrawlCancelledError(RuntimeError):
+    pass
+
+
 class SiteCrawler:
     def __init__(self, analyzer: Analyzer) -> None:
         self.analyzer = analyzer
         self.fetcher: SafeFetcher = analyzer.fetcher
 
     async def audit(self, request: SiteAuditRequest) -> dict[str, Any]:
+        snapshot = await self.crawl(SiteCrawlRequest.from_api_request(request))
+        return self._build_report(
+            request=snapshot.request,
+            start_url=snapshot.start_url,
+            origin=snapshot.origin,
+            robots=snapshot.robots,
+            sitemap=snapshot.sitemap,
+            crawled=snapshot.crawled,
+            failures=snapshot.failures,
+            blocked=snapshot.blocked,
+            out_of_scope_redirects=snapshot.out_of_scope_redirects,
+            discovered=snapshot.discovered,
+            inlinks=snapshot.inlinks,
+            source_links=snapshot.source_links,
+            queued_remaining=snapshot.queued_remaining,
+            processed_urls=snapshot.processed_urls,
+            effective_max_pages=snapshot.effective_max_pages,
+        )
+
+    async def crawl(
+        self,
+        request: SiteCrawlRequest,
+        *,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> SiteCrawlSnapshot:
+        self._raise_if_cancelled(should_cancel)
         parsed_start, _ = await self.fetcher.validate(request.url)
         start_url = normalize_url(str(parsed_start), keep_query=request.include_query_parameters)
         origin = origin_for(start_url)
         root_url = f"{origin}/"
         robots = await self._fetch_robots(origin)
+        self._raise_if_cancelled(should_cancel)
         if request.use_sitemap and not (
             request.respect_robots and robots.state in {"temporarily_unreachable", "fetch_error"}
         ):
@@ -94,10 +171,12 @@ class SiteCrawler:
         crawled: dict[str, CrawlRecord] = {}
         failures: list[dict[str, Any]] = []
         blocked: list[str] = []
-        out_of_scope_redirects: list[dict[str, str]] = []
+        out_of_scope_redirects: list[dict[str, Any]] = []
         discovered: set[str] = set(sitemap["urls"])
         inlinks: Counter[str] = Counter()
         source_links: dict[str, list[str]] = {}
+        redirects: dict[str, dict[str, Any]] = {}
+        url_context: dict[str, dict[str, Any]] = {}
 
         def enqueue(url: str, depth: int | None, source: str, *, front: bool = False) -> None:
             try:
@@ -106,10 +185,13 @@ class SiteCrawler:
                 return
             if not same_site(normalized, start_url, include_subdomains=request.include_subdomains):
                 return
+            if source not in {"requested", "site_root"} and not is_html_like_url(normalized):
+                return
             discovered.add(normalized)
             if normalized in queued or normalized in crawled:
                 return
             queued.add(normalized)
+            url_context[normalized] = {"depth": depth, "source": source}
             item = (normalized, depth, source)
             queue.appendleft(item) if front else queue.append(item)
 
@@ -142,6 +224,10 @@ class SiteCrawler:
                         return "out_of_scope", {
                             "source": url,
                             "target": artifact.report.final_url,
+                            "depth": depth,
+                            "status_code": (artifact.report.fetch.get("redirects") or [{}])[0].get(
+                                "status_code", 300
+                            ),
                         }
                     return "ok", CrawlRecord(artifact=artifact, depth=depth, source=source)
                 except FetchError as exc:
@@ -152,6 +238,7 @@ class SiteCrawler:
                         "code": exc.code,
                         "error": exc.message,
                         "status_code": exc.status_code,
+                        "upstream_status_code": exc.upstream_status_code,
                     }
                 except Exception as exc:  # pragma: no cover - final isolation boundary
                     return "error", {
@@ -163,17 +250,32 @@ class SiteCrawler:
                     }
 
         while queue and processed_urls < max_pages:
+            self._raise_if_cancelled(should_cancel)
             batch: list[tuple[str, int | None, str]] = []
             while (
                 queue
                 and len(batch) < request.concurrency
                 and processed_urls + len(batch) < max_pages
             ):
-                batch.append(queue.popleft())
+                item = queue.popleft()
+                if item[0] in crawled:
+                    continue
+                batch.append(item)
+            if not batch:
+                continue
             processed_urls += len(batch)
+            if on_progress:
+                on_progress(
+                    {
+                        "pages_crawled": processed_urls,
+                        "current_url": batch[0][0],
+                        "queued": len(queue),
+                    }
+                )
             results = await asyncio.gather(*(crawl_one(*item) for item in batch))
             newly_discovered: list[tuple[str, int, str]] = []
             for (url, depth, _source), (status, payload) in zip(batch, results, strict=True):
+                self._raise_if_cancelled(should_cancel)
                 if status == "blocked":
                     blocked.append(url)
                     continue
@@ -188,7 +290,17 @@ class SiteCrawler:
                     record.artifact.report.final_url,
                     keep_query=request.include_query_parameters,
                 )
-                crawled[final_key] = record
+                crawled.setdefault(final_key, record)
+                redirect_chain = record.artifact.report.fetch.get("redirects") or []
+                if final_key != url:
+                    redirects[url] = {
+                        "target": final_key,
+                        "status_code": redirect_chain[0].get("status_code", 300)
+                        if redirect_chain
+                        else 300,
+                        "chain": redirect_chain,
+                        "depth": depth,
+                    }
                 links = [
                     normalize_url(link, keep_query=request.include_query_parameters)
                     for link in record.artifact.parsed.internal_urls
@@ -209,7 +321,7 @@ class SiteCrawler:
                     enqueue(seed, None, "sitemap")
                 seeds_added = True
 
-        return self._build_report(
+        return SiteCrawlSnapshot(
             request=request,
             start_url=start_url,
             origin=origin,
@@ -222,10 +334,17 @@ class SiteCrawler:
             discovered=discovered,
             inlinks=inlinks,
             source_links=source_links,
+            redirects=redirects,
+            url_context=url_context,
             queued_remaining=len(queue),
             processed_urls=processed_urls,
             effective_max_pages=max_pages,
         )
+
+    @staticmethod
+    def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+        if should_cancel and should_cancel():
+            raise SiteCrawlCancelledError("Crawl cancelled")
 
     async def _fetch_robots(self, origin: str) -> RobotsSnapshot:
         url = f"{origin}/robots.txt"
@@ -401,7 +520,7 @@ class SiteCrawler:
     def _build_report(
         self,
         *,
-        request: SiteAuditRequest,
+        request: SiteCrawlRequest,
         start_url: str,
         origin: str,
         robots: RobotsSnapshot,

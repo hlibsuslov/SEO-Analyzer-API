@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     max_site_pages: int = Field(default=100, ge=1, le=1_000)
     scan_storage_path: str = "data/analyzer.db"
     scan_job_workers: int = Field(default=2, ge=1, le=16)
+    scan_job_lease_seconds: int = Field(default=30, ge=10, le=600)
 
     enable_pagespeed: bool = False
     pagespeed_api_key: SecretStr | None = None

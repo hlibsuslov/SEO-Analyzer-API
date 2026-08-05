@@ -11,16 +11,36 @@ from seo_analyzer.utils import utc_now_iso
 class ScanStorage:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        if str(self.path) != ":memory:":
+        self._memory = str(self.path) == ":memory:"
+        self._dsn = (
+            f"file:seo-analyzer-{uuid.uuid4().hex}?mode=memory&cache=shared"
+            if self._memory
+            else str(self.path)
+        )
+        self._keeper: sqlite3.Connection | None = None
+        if not self._memory:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        if self._memory:
+            self._keeper = self.connect()
         self.init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        conn = sqlite3.connect(
+            self._dsn,
+            check_same_thread=False,
+            timeout=10,
+            uri=self._memory,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
         return conn
+
+    def close(self) -> None:
+        if self._keeper is not None:
+            self._keeper.close()
+            self._keeper = None
 
     def init_schema(self) -> None:
         with self._lock, self.connect() as conn:
@@ -45,7 +65,9 @@ class ScanStorage:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    worker_id TEXT,
+                    heartbeat_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS pages (
                     scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
@@ -74,6 +96,18 @@ class ScanStorage:
                     ON links(scan_id, target_url);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
+            if "worker_id" not in columns:
+                conn.execute("ALTER TABLE scans ADD COLUMN worker_id TEXT")
+            if "heartbeat_at" not in columns:
+                conn.execute("ALTER TABLE scans ADD COLUMN heartbeat_at TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scans_status_heartbeat "
+                "ON scans(status, heartbeat_at)"
+            )
+            if not self._memory:
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
 
     def create_project(self, root_url: str, name: str | None = None) -> dict[str, Any]:
         project = {
@@ -157,6 +191,121 @@ class ScanStorage:
             rows = conn.execute(sql, params).fetchall()
         return [self._scan_from_row(row) for row in rows]
 
+    def recover_stale_scans(self, stale_before: str) -> list[str]:
+        """Requeue abandoned work and finalize abandoned cancellation requests."""
+
+        now = utc_now_iso()
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE scans
+                SET status = 'cancelled', finished_at = ?, worker_id = NULL, heartbeat_at = NULL
+                WHERE status = 'cancelling'
+                  AND (heartbeat_at IS NULL OR heartbeat_at <= ?)
+                """,
+                (now, stale_before),
+            )
+            conn.execute(
+                """
+                UPDATE scans
+                SET status = 'pending', worker_id = NULL, heartbeat_at = NULL,
+                    pages_crawled = 0, queued = 0, current_url = '',
+                    error = 'Recovered after an interrupted worker'
+                WHERE status = 'running'
+                  AND (heartbeat_at IS NULL OR heartbeat_at <= ?)
+                """,
+                (stale_before,),
+            )
+            rows = conn.execute(
+                "SELECT id FROM scans WHERE status = 'pending' ORDER BY created_at ASC"
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def claim_scan(self, scan_id: str, worker_id: str) -> bool:
+        now = utc_now_iso()
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scans
+                SET status = 'running', worker_id = ?, heartbeat_at = ?,
+                    started_at = ?, finished_at = NULL, error = NULL
+                WHERE id = ? AND status = 'pending'
+                """,
+                (worker_id, now, now, scan_id),
+            )
+        return cursor.rowcount == 1
+
+    def heartbeat(self, scan_id: str, worker_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scans SET heartbeat_at = ?
+                WHERE id = ? AND worker_id = ? AND status IN ('running', 'cancelling')
+                """,
+                (utc_now_iso(), scan_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def request_cancel(self, scan_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM scans WHERE id = ?", (scan_id,)).fetchone()
+            if not row or row["status"] not in {"pending", "running", "cancelling"}:
+                return False
+            if row["status"] == "pending":
+                conn.execute(
+                    """
+                    UPDATE scans
+                    SET status = 'cancelled', finished_at = ?, worker_id = NULL,
+                        heartbeat_at = NULL
+                    WHERE id = ?
+                    """,
+                    (utc_now_iso(), scan_id),
+                )
+            elif row["status"] == "running":
+                conn.execute("UPDATE scans SET status = 'cancelling' WHERE id = ?", (scan_id,))
+        return True
+
+    def cancellation_requested(self, scan_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT status FROM scans WHERE id = ?", (scan_id,)).fetchone()
+        return bool(row and row["status"] in {"cancelling", "cancelled"})
+
+    def release_owned_scan(self, scan_id: str, worker_id: str, *, error: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scans
+                SET status = 'pending', worker_id = NULL, heartbeat_at = NULL,
+                    pages_crawled = 0, queued = 0, current_url = '',
+                    error = ?, finished_at = NULL
+                WHERE id = ? AND worker_id = ? AND status IN ('running', 'cancelling')
+                """,
+                (error, scan_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
+    def finish_owned_scan(
+        self,
+        scan_id: str,
+        worker_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scans
+                SET status = ?, error = ?, finished_at = ?, worker_id = NULL,
+                    heartbeat_at = NULL
+                WHERE id = ? AND worker_id = ?
+                """,
+                (status, error, utc_now_iso(), scan_id, worker_id),
+            )
+        return cursor.rowcount == 1
+
     def update_scan(self, scan_id: str, **fields: Any) -> None:
         allowed = {
             "status",
@@ -167,6 +316,8 @@ class ScanStorage:
             "error",
             "started_at",
             "finished_at",
+            "worker_id",
+            "heartbeat_at",
         }
         assignments = []
         params = []
@@ -184,17 +335,39 @@ class ScanStorage:
                 params,
             )
 
-    def update_progress(self, scan_id: str, progress: dict[str, Any]) -> None:
-        self.update_scan(
-            scan_id,
-            pages_crawled=int(progress.get("pages_crawled") or 0),
-            queued=int(progress.get("queued") or 0),
-            current_url=progress.get("current_url") or "",
+    def update_progress(
+        self, scan_id: str, progress: dict[str, Any], *, worker_id: str | None = None
+    ) -> bool:
+        assignments = (
+            int(progress.get("pages_crawled") or 0),
+            int(progress.get("queued") or 0),
+            progress.get("current_url") or "",
+            utc_now_iso(),
         )
+        sql = (
+            "UPDATE scans SET pages_crawled = ?, queued = ?, current_url = ?, heartbeat_at = ? "
+            "WHERE id = ?"
+        )
+        params: tuple[Any, ...] = (*assignments, scan_id)
+        if worker_id:
+            sql += " AND worker_id = ? AND status IN ('running', 'cancelling')"
+            params = (*params, worker_id)
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(sql, params)
+        return cursor.rowcount == 1
 
-    def save_result(self, scan_id: str, result: dict[str, Any]) -> None:
+    def save_result(
+        self, scan_id: str, result: dict[str, Any], *, worker_id: str | None = None
+    ) -> bool:
         pages = result.get("crawl", {}).get("pages", {})
         with self._lock, self.connect() as conn:
+            if worker_id:
+                owner = conn.execute(
+                    "SELECT 1 FROM scans WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (scan_id, worker_id),
+                ).fetchone()
+                if not owner:
+                    return False
             conn.execute("DELETE FROM pages WHERE scan_id = ?", (scan_id,))
             conn.execute("DELETE FROM links WHERE scan_id = ?", (scan_id,))
             for url, page in pages.items():
@@ -211,12 +384,19 @@ class ScanStorage:
                         page.get("graph_node_id") or url,
                         int(page.get("status") or 0),
                         page.get("title") or "",
-                        int(page.get("depth") or 0),
+                        int(page["depth"]) if page.get("depth") is not None else -1,
                         seo.get("score"),
                         json.dumps(page, ensure_ascii=False),
                     ),
                 )
                 if page.get("redirected_to"):
+                    self._insert_link(
+                        conn,
+                        scan_id,
+                        url,
+                        {"url": page["redirected_to"], "zones": ["redirect"]},
+                        "redirect",
+                    )
                     continue
                 for entry in page.get("internal_links", []):
                     self._insert_link(conn, scan_id, url, entry, "internal")
@@ -225,7 +405,8 @@ class ScanStorage:
             conn.execute(
                 """
                 UPDATE scans
-                SET status = ?, result_json = ?, pages_crawled = ?, finished_at = ?, error = NULL
+                SET status = ?, result_json = ?, pages_crawled = ?, finished_at = ?,
+                    error = NULL, worker_id = NULL, heartbeat_at = NULL
                 WHERE id = ?
                 """,
                 (
@@ -236,6 +417,7 @@ class ScanStorage:
                     scan_id,
                 ),
             )
+        return True
 
     def get_result(self, scan_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -335,4 +517,6 @@ class ScanStorage:
         scan = dict(row)
         scan["options"] = json.loads(scan.pop("options_json") or "{}")
         scan.pop("result_json", None)
+        scan.pop("worker_id", None)
+        scan.pop("heartbeat_at", None)
         return scan

@@ -9,6 +9,7 @@ description = "Security-first SEO and growth-strategy analyzer for SaaS websites
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*.LICENSE"]
 authors = [{ name = "hlibsuslov", email = "glebsuslov720@gmail.com" }]
 keywords = ["seo", "saas", "fastapi", "crawler", "technical-seo"]
 classifiers = [

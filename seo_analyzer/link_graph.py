@@ -1,51 +1,14 @@
-import asyncio
 import hashlib
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
 from seo_analyzer.analyzer import AnalysisArtifact, Analyzer
-from seo_analyzer.crawler import SiteCrawler
-from seo_analyzer.fetcher import FetchError
+from seo_analyzer.crawler import SiteCrawlCancelledError, SiteCrawler, SiteCrawlRequest
 from seo_analyzer.models import Severity
-from seo_analyzer.utils import normalize_url, origin_for, same_site, utc_now_iso
-
-SKIP_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".ico",
-    ".bmp",
-    ".avif",
-    ".pdf",
-    ".zip",
-    ".tar",
-    ".gz",
-    ".rar",
-    ".7z",
-    ".mp3",
-    ".mp4",
-    ".avi",
-    ".mov",
-    ".webm",
-    ".wav",
-    ".ogg",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".otf",
-    ".css",
-    ".js",
-    ".mjs",
-    ".map",
-    ".json",
-    ".xml",
-}
+from seo_analyzer.utils import grade_for, normalize_url, utc_now_iso
 
 
 @dataclass(slots=True)
@@ -56,6 +19,7 @@ class UnifiedCrawlOptions:
     respect_robots: bool = True
     include_subdomains: bool = False
     include_query_parameters: bool = False
+    use_sitemap: bool = True
 
     def normalized(self, server_max_pages: int) -> "UnifiedCrawlOptions":
         return UnifiedCrawlOptions(
@@ -65,6 +29,7 @@ class UnifiedCrawlOptions:
             respect_robots=bool(self.respect_robots),
             include_subdomains=bool(self.include_subdomains),
             include_query_parameters=bool(self.include_query_parameters),
+            use_sitemap=bool(self.use_sitemap),
         )
 
 
@@ -81,111 +46,69 @@ async def crawl_unified_site(
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     options = (options or UnifiedCrawlOptions()).normalized(analyzer.settings.max_site_pages)
-    parsed_start, _ = await analyzer.fetcher.validate(start_url)
-    start = normalize_url(str(parsed_start), keep_query=options.include_query_parameters)
-    root_domain = urlsplit(start).hostname or ""
     crawler = SiteCrawler(analyzer)
-    robots = await crawler._fetch_robots(origin_for(start))
+    request = SiteCrawlRequest(
+        url=start_url,
+        max_pages=options.max_pages,
+        max_depth=options.max_depth,
+        concurrency=options.concurrency,
+        respect_robots=options.respect_robots,
+        include_subdomains=options.include_subdomains,
+        include_query_parameters=options.include_query_parameters,
+        use_sitemap=options.use_sitemap,
+    )
+    try:
+        snapshot = await crawler.crawl(
+            request,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+        )
+    except SiteCrawlCancelledError as exc:
+        raise UnifiedCrawlCancelledError(str(exc)) from exc
 
-    queue: deque[tuple[str, int]] = deque([(start, 0)])
-    queued: set[str] = {start}
-    visited: set[str] = set()
+    start = snapshot.start_url
+    root_domain = urlsplit(start).hostname or ""
     pages: dict[str, dict[str, Any]] = {}
-    semaphore = asyncio.Semaphore(options.concurrency)
 
-    async def analyze_one(url: str, depth: int) -> tuple[str, int, str, Any]:
-        if options.respect_robots and not robots.can_fetch(
-            analyzer.settings.robots_user_agent, url
-        ):
-            return "blocked", depth, url, None
-        async with semaphore:
-            try:
-                artifact = await analyzer.analyze_artifact(
-                    url, include_subdomains=options.include_subdomains
-                )
-                return "ok", depth, url, artifact
-            except FetchError as exc:
-                return "error", depth, url, exc
-            except Exception as exc:  # pragma: no cover - defensive isolation
-                return "error", depth, url, exc
-
-    while queue and len(visited) < options.max_pages:
-        _raise_if_cancelled(should_cancel)
-        batch: list[tuple[str, int]] = []
-        while (
-            queue
-            and len(batch) < options.concurrency
-            and len(visited) + len(batch) < options.max_pages
-        ):
-            url, depth = queue.popleft()
-            if url in visited or depth > options.max_depth:
-                continue
-            visited.add(url)
-            batch.append((url, depth))
-            _progress(on_progress, len(visited), url, len(queue))
-        if not batch:
-            continue
-
-        results = await asyncio.gather(*(analyze_one(url, depth) for url, depth in batch))
-        for status, depth, requested_url, payload in results:
-            _raise_if_cancelled(should_cancel)
-            if status == "blocked":
-                pages[requested_url] = _blocked_page(requested_url, depth)
-                continue
-            if status == "error":
-                pages[requested_url] = _error_page(requested_url, depth, payload)
-                continue
-
-            artifact: AnalysisArtifact = payload
-            final_url = normalize_url(
-                artifact.report.final_url,
-                keep_query=options.include_query_parameters,
-            )
-            if not same_site(final_url, start, include_subdomains=options.include_subdomains):
-                pages[requested_url] = _redirect_out_of_scope_page(requested_url, final_url, depth)
-                continue
-            pages[final_url] = _page_from_artifact(final_url, depth, artifact)
-            if final_url != requested_url:
-                pages[requested_url] = {
-                    "url": requested_url,
-                    "graph_node_id": graph_node_id(requested_url),
-                    "title": "",
-                    "status": 300,
-                    "depth": depth,
-                    "redirected_to": final_url,
-                    "internal_links": [],
-                    "external_links": [],
-                    "incoming_links": [],
-                    "seo": {
-                        "score": 86,
-                        "grade": "B",
-                        "issues": [
-                            {
-                                "severity": "medium",
-                                "code": "redirect",
-                                "message": f"URL redirects to {final_url}",
-                            }
-                        ],
-                    },
-                }
-
-            if depth < options.max_depth:
-                for link in artifact.parsed.internal_urls:
-                    try:
-                        normalized = normalize_url(
-                            link, keep_query=options.include_query_parameters
-                        )
-                    except (ValueError, UnicodeError):
-                        continue
-                    if not _is_html_like(normalized):
-                        continue
-                    if not same_site(
-                        normalized, start, include_subdomains=options.include_subdomains
-                    ):
-                        continue
-                    if normalized not in visited and normalized not in queued:
-                        queued.add(normalized)
-                        queue.append((normalized, depth + 1))
+    for final_url, record in snapshot.crawled.items():
+        pages[final_url] = _page_from_artifact(
+            final_url,
+            record.depth,
+            record.artifact,
+            keep_query=options.include_query_parameters,
+        )
+    for source, redirect in snapshot.redirects.items():
+        pages[source] = _redirect_page(
+            source,
+            redirect["target"],
+            redirect.get("depth"),
+            int(redirect.get("status_code") or 300),
+            redirect.get("chain") or [],
+        )
+    for url in snapshot.blocked:
+        context = snapshot.url_context.get(url) or {}
+        pages.setdefault(url, _blocked_page(url, context.get("depth")))
+    for failure in snapshot.failures:
+        pages.setdefault(
+            failure["url"],
+            _error_page_data(
+                failure["url"],
+                failure.get("depth"),
+                failure.get("code") or "fetch_error",
+                failure.get("error") or "Page fetch failed",
+                failure.get("upstream_status_code"),
+            ),
+        )
+    for redirect in snapshot.out_of_scope_redirects:
+        pages.setdefault(
+            redirect["source"],
+            _redirect_out_of_scope_page(
+                redirect["source"],
+                redirect["target"],
+                redirect.get("depth"),
+                int(redirect.get("status_code") or 300),
+            ),
+        )
 
     crawl = {"start_url": start, "root_domain": root_domain, "pages": pages}
     _apply_incoming_and_site_issues(crawl)
@@ -197,7 +120,9 @@ async def crawl_unified_site(
         "crawl": crawl,
         "stats": stats,
         "graph": graph,
-        "robots": robots.public_dict(),
+        "robots": snapshot.robots.public_dict(),
+        "sitemap": {key: value for key, value in snapshot.sitemap.items() if key != "urls"}
+        | {"url_samples": snapshot.sitemap.get("urls", [])[:100]},
         "options": {
             "max_pages": options.max_pages,
             "max_depth": options.max_depth,
@@ -205,6 +130,7 @@ async def crawl_unified_site(
             "respect_robots": options.respect_robots,
             "include_subdomains": options.include_subdomains,
             "include_query_parameters": options.include_query_parameters,
+            "use_sitemap": options.use_sitemap,
         },
     }
 
@@ -220,28 +146,35 @@ def build_stats(crawl: dict[str, Any]) -> dict[str, Any]:
     outbound: Counter[str] = Counter()
     external_domains: Counter[str] = Counter()
     edges_internal: list[list[Any]] = []
+    redirect_edges: list[list[str]] = []
     redirects = []
     broken_links = []
+    discovered_internal_links = 0
 
     for url, page in pages.items():
         if page.get("redirected_to"):
+            target = page["redirected_to"]
             redirects.append(
                 {
                     "url": url,
-                    "redirected_to": page["redirected_to"],
+                    "redirected_to": target,
                     "status": page.get("status", 0),
                 }
             )
+            if target in pages:
+                inbound[target] += 1
+                outbound[url] = 1
+                redirect_edges.append([url, target])
 
     for source, page in real.items():
-        outbound[source] = len(page.get("internal_links", []))
+        outbound[source] = 0
         for entry in page.get("internal_links", []):
+            discovered_internal_links += 1
             target = entry["url"]
             zones = entry.get("zones") or ["content"]
-            if target in pages and pages[target].get("redirected_to"):
-                target = pages[target]["redirected_to"]
-            if source == target:
+            if source == target or target not in pages:
                 continue
+            outbound[source] += 1
             inbound[target] += 1
             edges_internal.append([source, target, zones])
             target_page = pages.get(target)
@@ -272,7 +205,9 @@ def build_stats(crawl: dict[str, Any]) -> dict[str, Any]:
         "root_domain": crawl.get("root_domain", ""),
         "start_url": crawl.get("start_url", ""),
         "total_pages": len(real),
+        "total_graph_nodes": len(pages),
         "total_internal_links": len(edges_internal),
+        "total_discovered_internal_links": discovered_internal_links,
         "total_external_links": sum(external_domains.values()),
         "unique_external_domains": len(external_domains),
         "inbound": dict(inbound),
@@ -285,7 +220,13 @@ def build_stats(crawl: dict[str, Any]) -> dict[str, Any]:
         "broken_pages": broken_pages,
         "broken_links": broken_links,
         "redirects": redirects,
-        "cycles": find_cycles(real.keys(), edges_internal),
+        "cycles": find_cycles(
+            pages.keys(),
+            [
+                *edges_internal,
+                *([source, target, ["redirect"]] for source, target in redirect_edges),
+            ],
+        ),
         "duplicate_titles": _duplicates(
             (page.get("title") or "").strip().lower() for page in real.values()
         ),
@@ -293,20 +234,23 @@ def build_stats(crawl: dict[str, Any]) -> dict[str, Any]:
             ((page.get("meta") or {}).get("description") or "").strip().lower()
             for page in real.values()
         ),
-        "max_depth": max((int(page.get("depth") or 0) for page in real.values()), default=0),
+        "max_depth": max(
+            (int(page["depth"]) for page in real.values() if page.get("depth") is not None),
+            default=0,
+        ),
         "average_seo_score": _average(
             (page.get("seo") or {}).get("score") for page in real.values()
         ),
         "edges_internal": edges_internal,
+        "edges_redirect": redirect_edges,
     }
 
 
 def build_graph(crawl: dict[str, Any], stats: dict[str, Any] | None = None) -> dict[str, Any]:
     pages = crawl.get("pages", {})
     stats = stats or build_stats(crawl)
-    real = {url: page for url, page in pages.items() if "redirected_to" not in page}
     nodes = []
-    for url, page in real.items():
+    for url, page in pages.items():
         seo = page.get("seo") or {}
         issues = seo.get("issues") or []
         nodes.append(
@@ -317,9 +261,10 @@ def build_graph(crawl: dict[str, Any], stats: dict[str, Any] | None = None) -> d
                 "status": page.get("status", 0),
                 "content_type": page.get("content_type", ""),
                 "depth": page.get("depth", 0),
-                "inbound": len(page.get("incoming_links") or []),
-                "internal_out": len(page.get("internal_links") or []),
+                "inbound": int((stats.get("inbound") or {}).get(url, 0)),
+                "internal_out": int((stats.get("outbound") or {}).get(url, 0)),
                 "external_out": len(page.get("external_links") or []),
+                "redirected_to": page.get("redirected_to"),
                 "seo_score": seo.get("score"),
                 "seo_grade": seo.get("grade"),
                 "seo_issue_count": len(issues),
@@ -333,19 +278,43 @@ def build_graph(crawl: dict[str, Any], stats: dict[str, Any] | None = None) -> d
         )
     edges = []
     for source, target, zones in stats.get("edges_internal", []):
-        if source in real and target in real:
+        if source in pages and target in pages:
             edges.append(
                 {
-                    "source": real[source].get("graph_node_id") or graph_node_id(source),
-                    "target": real[target].get("graph_node_id") or graph_node_id(target),
+                    "source": pages[source].get("graph_node_id") or graph_node_id(source),
+                    "target": pages[target].get("graph_node_id") or graph_node_id(target),
                     "source_url": source,
                     "target_url": target,
                     "type": "internal",
                     "zones": zones,
                 }
             )
+    for source, target in stats.get("edges_redirect", []):
+        if source in pages and target in pages:
+            edges.append(
+                {
+                    "source": pages[source].get("graph_node_id") or graph_node_id(source),
+                    "target": pages[target].get("graph_node_id") or graph_node_id(target),
+                    "source_url": source,
+                    "target_url": target,
+                    "type": "redirect",
+                    "zones": ["redirect"],
+                }
+            )
     external_edges: list[dict[str, Any]] = []
-    for source, page in real.items():
+    for source, page in pages.items():
+        redirect_target = page.get("redirected_to")
+        if redirect_target and redirect_target not in pages:
+            external_edges.append(
+                {
+                    "source": page.get("graph_node_id") or graph_node_id(source),
+                    "source_url": source,
+                    "target_url": redirect_target,
+                    "target_domain": urlsplit(redirect_target).hostname or "",
+                    "type": "redirect_external",
+                    "zones": ["redirect"],
+                }
+            )
         external_edges.extend(
             {
                 "source": page.get("graph_node_id") or graph_node_id(source),
@@ -405,15 +374,21 @@ def find_cycles(urls: Any, edges_internal: list[list[Any]], limit: int = 50) -> 
     return cycles[:limit]
 
 
-def _page_from_artifact(url: str, depth: int, artifact: AnalysisArtifact) -> dict[str, Any]:
+def _page_from_artifact(
+    url: str,
+    depth: int | None,
+    artifact: AnalysisArtifact,
+    *,
+    keep_query: bool,
+) -> dict[str, Any]:
     report = artifact.report
     links = report.links
-    internal_links = [
-        {"url": item["url"], "zones": ["content"]} for item in links["internal"]["items"]
-    ]
-    external_links = [
-        {"url": item["url"], "zones": ["content"]} for item in links["external"]["items"]
-    ]
+    internal_links = _normalized_link_entries(
+        artifact.parsed.internal_link_records, keep_query=keep_query
+    )
+    external_links = _normalized_link_entries(
+        artifact.parsed.external_link_records, keep_query=keep_query
+    )
     return {
         "url": url,
         "graph_node_id": graph_node_id(url),
@@ -471,7 +446,7 @@ def _page_from_artifact(url: str, depth: int, artifact: AnalysisArtifact) -> dic
 def _apply_incoming_and_site_issues(crawl: dict[str, Any]) -> None:
     pages = crawl["pages"]
     real = {url: page for url, page in pages.items() if "redirected_to" not in page}
-    incoming: dict[str, list[dict[str, Any]]] = {url: [] for url in real}
+    incoming: dict[str, list[dict[str, Any]]] = {url: [] for url in pages}
     title_counts = Counter((page.get("title") or "").strip().lower() for page in real.values())
     desc_counts = Counter(
         ((page.get("meta") or {}).get("description") or "").strip().lower()
@@ -479,7 +454,7 @@ def _apply_incoming_and_site_issues(crawl: dict[str, Any]) -> None:
     )
     for source, page in real.items():
         for entry in page.get("internal_links", []):
-            target = pages.get(entry["url"], {}).get("redirected_to") or entry["url"]
+            target = entry["url"]
             if target in incoming and target != source:
                 incoming[target].append({"url": source, "zones": entry.get("zones") or ["content"]})
             target_page = pages.get(target)
@@ -487,9 +462,17 @@ def _apply_incoming_and_site_issues(crawl: dict[str, Any]) -> None:
                 _add_issue(
                     page, "high", "broken_internal_link", f"Internal link points to {target}"
                 )
-    for url, page in real.items():
-        page["incoming_links"] = incoming.get(url, [])
+                (page.get("seo") or {}).setdefault("links", {}).setdefault("broken", []).append(
+                    {"url": target, "status": target_page.get("status")}
+                )
+    for source, page in pages.items():
+        target = page.get("redirected_to")
+        if target in incoming:
+            incoming[target].append({"url": source, "zones": ["redirect"]})
+    for source, page in pages.items():
+        page["incoming_links"] = incoming.get(source, [])
         page["inbound_internal_count"] = len(page["incoming_links"])
+    for url, page in real.items():
         title = (page.get("title") or "").strip().lower()
         desc = ((page.get("meta") or {}).get("description") or "").strip().lower()
         if title and title_counts[title] > 1:
@@ -508,8 +491,9 @@ def _apply_incoming_and_site_issues(crawl: dict[str, Any]) -> None:
 def _add_issue(page: dict[str, Any], severity: str, code: str, message: str) -> None:
     seo = page.setdefault("seo", {"issues": [], "score": 100})
     issues = seo.setdefault("issues", [])
-    if not any(issue.get("code") == code for issue in issues):
-        issues.append({"severity": severity, "code": code, "message": message})
+    if any(issue.get("code") == code for issue in issues):
+        return
+    issues.append({"severity": severity, "code": code, "message": message})
     penalties = {
         Severity.CRITICAL.value: 20,
         Severity.HIGH.value: 12,
@@ -517,11 +501,13 @@ def _add_issue(page: dict[str, Any], severity: str, code: str, message: str) -> 
         Severity.LOW.value: 3,
         Severity.INFO.value: 1,
     }
-    score = 100 - sum(penalties.get(issue.get("severity"), 2) for issue in issues)
-    seo["score"] = max(0, min(float(seo.get("score", score)), score))
+    current_score = float(seo.get("score") if seo.get("score") is not None else 100)
+    score = max(0.0, current_score - penalties.get(severity, 2))
+    seo["score"] = score
+    seo["grade"] = grade_for(score)[0]
 
 
-def _blocked_page(url: str, depth: int) -> dict[str, Any]:
+def _blocked_page(url: str, depth: int | None) -> dict[str, Any]:
     return {
         "url": url,
         "graph_node_id": graph_node_id(url),
@@ -533,6 +519,7 @@ def _blocked_page(url: str, depth: int) -> dict[str, Any]:
         "incoming_links": [],
         "seo": {
             "score": 0,
+            "grade": "F",
             "issues": [
                 {"severity": "medium", "code": "robots_blocked", "message": "Blocked by robots.txt"}
             ],
@@ -540,15 +527,18 @@ def _blocked_page(url: str, depth: int) -> dict[str, Any]:
     }
 
 
-def _error_page(url: str, depth: int, exc: Exception) -> dict[str, Any]:
-    message = getattr(exc, "message", str(exc))
-    code = getattr(exc, "code", "fetch_error")
-    status_code = getattr(exc, "status_code", 0)
+def _error_page_data(
+    url: str,
+    depth: int | None,
+    code: str,
+    message: str,
+    upstream_status_code: int | None = None,
+) -> dict[str, Any]:
     return {
         "url": url,
         "graph_node_id": graph_node_id(url),
         "title": "",
-        "status": status_code if isinstance(status_code, int) else 0,
+        "status": upstream_status_code or 0,
         "depth": depth,
         "internal_links": [],
         "external_links": [],
@@ -556,32 +546,70 @@ def _error_page(url: str, depth: int, exc: Exception) -> dict[str, Any]:
         "error": message,
         "seo": {
             "score": 0,
+            "grade": "F",
             "issues": [{"severity": "high", "code": code, "message": message}],
         },
     }
 
 
-def _redirect_out_of_scope_page(source: str, target: str, depth: int) -> dict[str, Any]:
-    page = _error_page(
-        source, depth, FetchError("out_of_scope_redirect", f"Redirected to {target}")
-    )
-    page["redirected_to"] = target
+def _redirect_page(
+    source: str,
+    target: str,
+    depth: int | None,
+    status_code: int,
+    chain: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "url": source,
+        "graph_node_id": graph_node_id(source),
+        "title": "",
+        "status": status_code,
+        "content_type": "",
+        "depth": depth,
+        "redirected_to": target,
+        "redirect_chain": chain,
+        "internal_links": [],
+        "external_links": [],
+        "incoming_links": [],
+        "seo": {
+            "score": None,
+            "grade": None,
+            "issues": [
+                {
+                    "severity": "medium",
+                    "code": "redirect",
+                    "message": f"URL redirects to {target}",
+                }
+            ],
+        },
+    }
+
+
+def _redirect_out_of_scope_page(
+    source: str, target: str, depth: int | None, status_code: int
+) -> dict[str, Any]:
+    page = _redirect_page(source, target, depth, status_code, [])
+    page["seo"]["issues"] = [
+        {
+            "severity": "high",
+            "code": "out_of_scope_redirect",
+            "message": f"Redirected outside the crawl scope to {target}",
+        }
+    ]
     return page
 
 
-def _is_html_like(url: str) -> bool:
-    path = urlsplit(url).path.lower()
-    return not any(path.endswith(extension) for extension in SKIP_EXTENSIONS)
-
-
-def _raise_if_cancelled(should_cancel: Any) -> None:
-    if should_cancel is not None and should_cancel():
-        raise UnifiedCrawlCancelledError("Scan cancelled")
-
-
-def _progress(on_progress: Any, pages_crawled: int, current_url: str, queued: int) -> None:
-    if on_progress is not None:
-        on_progress({"pages_crawled": pages_crawled, "current_url": current_url, "queued": queued})
+def _normalized_link_entries(
+    records: list[dict[str, Any]], *, keep_query: bool
+) -> list[dict[str, Any]]:
+    merged: dict[str, set[str]] = {}
+    for record in records:
+        try:
+            url = normalize_url(record["url"], keep_query=keep_query)
+        except (KeyError, ValueError, UnicodeError):
+            continue
+        merged.setdefault(url, set()).update(record.get("zones") or ["content"])
+    return [{"url": url, "zones": sorted(zones)} for url, zones in merged.items()]
 
 
 def _duplicates(values: Any) -> list[dict[str, Any]]:

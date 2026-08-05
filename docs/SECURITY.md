@@ -44,11 +44,21 @@ Analysis responses add a request ID, `nosniff`, a no-referrer policy and `Cache-
 
 PageSpeed is disabled by default. When enabled and requested, the final validated public URL is sent to Google PageSpeed Insights. That creates a third-party data and quota dependency; document it in your privacy/processing model and protect `SEO_PAGESPEED_API_KEY` in the environment.
 
-Page HTML is processed in memory and cached in summarized analysis form for a bounded TTL. This project has no database and does not intentionally persist fetched HTML. Multi-worker deployments have independent caches and metrics.
+Page HTML is processed in memory and cached in summarized analysis form for a
+bounded TTL. Persistent scans store normalized URLs, extracted metadata, links,
+SEO findings, graph data, and status/timing summaries in SQLite; raw HTML response
+bodies are not intentionally persisted. Multi-worker deployments have independent
+caches and metrics, while scan ownership and cancellation are coordinated through
+SQLite worker leases.
 
 ## Container posture
 
-The supplied image runs as a non-root system user. Compose binds to loopback, drops all Linux capabilities, sets `no-new-privileges`, uses a read-only root filesystem, provides a small `/tmp` tmpfs and declares a memory limit. Put a production reverse proxy in front; do not expose the Uvicorn development topology as a complete security perimeter.
+The supplied image runs as a non-root system user. Compose binds to loopback,
+drops all Linux capabilities, sets `no-new-privileges`, uses a read-only root
+filesystem, persists scan data in a dedicated `/data` volume, provides a small
+`/tmp` tmpfs, and declares a memory limit. Put a production reverse proxy in
+front; do not expose the Uvicorn development topology as a complete security
+perimeter.
 
 Container restrictions do not replace outbound firewall rules. For higher-risk deployments, allow egress only to public HTTP(S), run in a dedicated network/namespace, configure DNS deliberately and set infrastructure-level CPU/request/time limits.
 

@@ -238,3 +238,29 @@ def test_unified_link_graph_scan_endpoints(tmp_path) -> None:
             assert "Link Graph" in dashboard.text
     finally:
         close_analyzer(analyzer)
+
+
+def test_link_graph_ui_uses_api_key_for_dashboard_fetch(tmp_path) -> None:
+    client, analyzer = build_client(
+        api_key="graph-secret",
+        scan_storage_path=str(tmp_path / "protected-scans.db"),
+    )
+    try:
+        with client:
+            assert (
+                client.post("/api/projects", json={"url": "https://saas.test"}).status_code == 401
+            )
+            assert (
+                client.post(
+                    "/api/projects",
+                    headers={"X-API-Key": "graph-secret"},
+                    json={"url": "https://saas.test"},
+                ).status_code
+                == 201
+            )
+            app = client.get("/app")
+            assert app.status_code == 200
+            assert "headers: headers(false)" in app.text
+            assert 'href="/api/scans/' not in app.text
+    finally:
+        close_analyzer(analyzer)

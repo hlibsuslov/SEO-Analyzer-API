@@ -98,6 +98,8 @@ class ParsedPage:
     sections: dict[str, Any]
     internal_urls: list[str]
     external_urls: list[str]
+    internal_link_records: list[dict[str, Any]]
+    external_link_records: list[dict[str, Any]]
     page_type: PageType
     title: str
     description: str
@@ -121,6 +123,26 @@ def _link_rel(tag: Tag) -> set[str]:
         return set()
     values = rel.split() if isinstance(rel, str) else rel
     return {str(value).lower() for value in values}
+
+
+def _link_zone(anchor: Tag) -> str:
+    zone = "content"
+    for parent in [anchor, *anchor.parents]:
+        if not isinstance(parent, Tag):
+            continue
+        name = parent.name.lower() if parent.name else ""
+        tokens = {
+            str(token).lower()
+            for token in [parent.get("id", ""), *(parent.get("class") or [])]
+            if token
+        }
+        if name == "header" or tokens & {"header", "site-header"}:
+            zone = "header"
+        elif name == "footer" or tokens & {"footer", "site-footer"}:
+            zone = "footer"
+        elif name == "nav" or tokens & {"nav", "navbar", "navigation", "main-nav", "site-menu"}:
+            zone = "nav"
+    return zone
 
 
 def _absolute_url(base_url: str, raw_url: str) -> str | None:
@@ -259,7 +281,7 @@ def _extract_links(
     base_url: str,
     *,
     include_subdomains: bool,
-) -> tuple[dict[str, Any], list[str], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     skipped_non_web = 0
     empty_anchor_count = 0
@@ -291,6 +313,7 @@ def _extract_links(
                 "url": absolute,
                 "anchor": effective_anchor,
                 "rel": rel,
+                "zones": [_link_zone(anchor)],
                 "internal": same_site(absolute, base_url, include_subdomains=include_subdomains),
             }
         )
@@ -298,8 +321,13 @@ def _extract_links(
     unique: dict[str, dict[str, Any]] = {}
     for record in records:
         existing = unique.get(record["url"])
-        if existing is None or (not existing["anchor"] and record["anchor"]):
-            unique[record["url"]] = record
+        if existing is None:
+            unique[record["url"]] = record.copy()
+            continue
+        existing["zones"] = sorted(set(existing["zones"]) | set(record["zones"]))
+        existing["rel"] = sorted(set(existing["rel"]) | set(record["rel"]))
+        if not existing["anchor"] and record["anchor"]:
+            existing["anchor"] = record["anchor"]
     internal = [record for record in unique.values() if record["internal"]]
     external = [record for record in unique.values() if not record["internal"]]
     nofollow = sum("nofollow" in record["rel"] for record in records)
@@ -322,8 +350,8 @@ def _extract_links(
             "broken": [],
             "broken_note": "Broken-link status is populated by a site crawl; a single-page parse does not request every target.",
         },
-        [record["url"] for record in internal],
-        [record["url"] for record in external],
+        internal,
+        external,
     )
 
 
@@ -452,9 +480,11 @@ def parse_page(fetch: FetchResult, *, include_subdomains: bool = False) -> Parse
     headings = _extract_headings(soup)
     h1_texts = [item["text"] for item in headings["items"] if item["level"] == 1]
     structured_data = _extract_structured_data(soup)
-    links, internal_urls, external_urls = _extract_links(
+    links, internal_link_records, external_link_records = _extract_links(
         soup, fetch.final_url, include_subdomains=include_subdomains
     )
+    internal_urls = [record["url"] for record in internal_link_records]
+    external_urls = [record["url"] for record in external_link_records]
     content, visible_text, text_signature = _extract_content(soup)
     content["text_to_html_ratio_percent"] = (
         round((len(visible_text.encode("utf-8")) / len(fetch.content)) * 100, 1)
@@ -592,6 +622,8 @@ def parse_page(fetch: FetchResult, *, include_subdomains: bool = False) -> Parse
         sections=sections,
         internal_urls=list(dict.fromkeys(internal_urls)),
         external_urls=list(dict.fromkeys(external_urls)),
+        internal_link_records=internal_link_records,
+        external_link_records=external_link_records,
         page_type=page_type,
         title=title,
         description=description,

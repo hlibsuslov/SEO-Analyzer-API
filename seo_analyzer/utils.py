@@ -15,6 +15,41 @@ TRACKING_PARAMETERS = {
     "wbraid",
 }
 
+NON_HTML_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".avif",
+    ".bmp",
+    ".css",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".map",
+    ".mjs",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".otf",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".svg",
+    ".tar",
+    ".ttf",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".xml",
+    ".zip",
+}
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -70,6 +105,13 @@ def same_site(candidate_url: str, base_url: str, *, include_subdomains: bool = F
     # www.co.uk or a multi-tenant host into a cross-tenant crawl boundary. The
     # exact root/www pair above is safe because no arbitrary sibling is admitted.
     return candidate.endswith(f".{base}")
+
+
+def is_html_like_url(url: str) -> bool:
+    # Runs once per discovered link, so the path is split and lowered a single time.
+    path = urlsplit(url).path.lower()
+    _, separator, extension = path.rpartition(".")
+    return not separator or f".{extension}" not in NON_HTML_EXTENSIONS
 
 
 def grade_for(score: float) -> tuple[str, str]:

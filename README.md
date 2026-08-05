@@ -17,6 +17,25 @@ This fork is a ground-up v2 implementation of [KovalDenys1/SEO-Analyzer-API](htt
 - Ranks supplied Search Console/conversion rows by traffic and revenue opportunity without inventing external keyword or SERP data.
 - Optionally enriches a page with Google PageSpeed Insights v5 lab/field data.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[API or browser UI] --> API[FastAPI]
+    API --> Jobs[Bounded scan manager]
+    Jobs --> Crawler[Shared SiteCrawler]
+    Crawler --> Fetcher[SafeFetcher]
+    Crawler --> Parser[HTML parser and SEO scoring]
+    Parser --> Graph[Link graph and site-level issues]
+    Graph --> Storage[(SQLite)]
+    Storage --> API
+    API --> Dashboard[Interactive graph dashboard]
+```
+
+`/v1/site-audit` and persistent link-graph scans use the same crawler engine.
+Each fetched document is parsed once, then reused for SEO scoring, internal and
+external edges, duplicate/orphan/broken-link checks, storage, and visualization.
+
 ## Safety by default
 
 The service fetches user-supplied URLs, so URL handling is part of the security boundary:
@@ -43,8 +62,20 @@ Private-network access can be enabled for a trusted internal deployment, but it 
 | `POST` | `/v1/opportunities` | First-party traffic/revenue opportunity ranking |
 | `GET` | `/app` | Minimal browser UI for unified link-graph scans |
 | `POST` | `/api/projects` | Create a persistent crawl project |
+| `GET` | `/api/projects` | List projects |
+| `GET` | `/api/projects/{project_id}` | Get one project |
 | `POST` | `/api/projects/{project_id}/scans` | Start a background crawl + graph + SEO scan |
+| `GET` | `/api/projects/{project_id}/scans` | List project scans |
+| `GET` | `/api/scans/{scan_id}/status` | Get progress and terminal status |
+| `POST` | `/api/scans/{scan_id}/cancel` | Cancel pending or running work |
+| `POST` | `/api/scans/{scan_id}/rerun` | Create a new scan with the same options |
+| `GET` | `/api/scans/{scan_id}/pages` | List page records and attached SEO data |
+| `GET` | `/api/scans/{scan_id}/page?url=...` | Resolve a page by normalized URL |
+| `GET` | `/api/scans/{scan_id}/pages/{graph_node_id}` | Resolve a page by graph node ID |
+| `GET` | `/api/scans/{scan_id}/links` | List internal, external, or redirect links |
 | `GET` | `/api/scans/{scan_id}/graph` | Graph nodes/edges with SEO data attached |
+| `GET` | `/api/scans/{scan_id}/seo/issues` | List page and site-level SEO issues |
+| `GET` | `/api/scans/{scan_id}/stats` | Site totals, duplicates, cycles, orphans, and failures |
 | `GET` | `/api/scans/{scan_id}/dashboard` | Interactive graph dashboard for a completed scan |
 | `GET` | `/analyze` | Backwards-compatible original full-analysis shape plus `v2` data |
 | `GET` | `/quick-score` | Score, warnings, and top recommendations |
@@ -107,7 +138,9 @@ If `SEO_API_KEY` is set, add `-H 'X-API-Key: …'` to protected endpoints.
 
 ## Docker
 
-The image runs as a non-root user. The Compose example binds only to loopback, drops Linux capabilities, uses a read-only filesystem, and adds a health check.
+The image runs as a non-root user. The Compose example binds only to loopback,
+drops Linux capabilities, uses a read-only root filesystem, and persists SQLite
+in the `analyzer-data` volume mounted at `/data`.
 
 ```bash
 cp .env.example .env
@@ -129,7 +162,8 @@ All settings use the `SEO_` prefix. See [`.env.example`](.env.example) for the c
 | `SEO_CACHE_TTL_SECONDS` | `300` | Analysis cache TTL; `0` disables cache |
 | `SEO_MAX_SITE_PAGES` | `100` | Server-side hard cap for a site audit |
 | `SEO_SCAN_STORAGE_PATH` | `data/analyzer.db` | SQLite storage for persistent link-graph scans |
-| `SEO_SCAN_JOB_WORKERS` | `2` | Reserved scan worker budget for deployments |
+| `SEO_SCAN_JOB_WORKERS` | `2` | Concurrent link-graph scans per API process |
+| `SEO_SCAN_JOB_LEASE_SECONDS` | `30` | Time before an abandoned running scan is requeued |
 | `SEO_ENABLE_PAGESPEED` | `false` | Permit quota-consuming PageSpeed calls |
 | `SEO_PAGESPEED_API_KEY` | empty | Optional Google API key |
 | `SEO_CORS_ORIGINS` | empty | Comma-separated browser origins |
@@ -152,6 +186,23 @@ pip-audit
 
 The suite covers URL security, DNS/redirect validation, parsing, page classification, issue scoring, sitemap/robots behavior, crawl aggregation, PageSpeed normalization, API compatibility, auth, and opportunity ranking.
 
+## Scan data
+
+SQLite stores projects, scans, normalized page URLs, stable graph node IDs,
+links with page zones, SEO reports, status/depth/timing metadata, and the complete
+versioned result snapshot. HTML response bodies are not persisted. Running scans
+write a worker lease and heartbeat; graceful shutdown requeues active work, while
+an abandoned lease is recovered automatically.
+
+## Known limitations
+
+- Crawls are bounded samples and do not execute client-side JavaScript.
+- External targets are represented in the graph but are not fetched or checked.
+- SQLite is intended for local and small-team deployments; high-volume distributed
+  deployments should replace the storage/job backend.
+- Worker limits apply per API process. Global fetch concurrency is still bounded
+  by `SEO_MAX_CONCURRENT_FETCHES` in each process.
+
 ## Documentation
 
 - [API guide](docs/API.md)
@@ -163,4 +214,7 @@ The suite covers URL security, DNS/redirect validation, parsing, page classifica
 
 ## License and attribution
 
-MIT. The upstream project is copyright Denys Koval; this fork preserves the original license and history. See [LICENSE](LICENSE).
+MIT. The upstream project is copyright Denys Koval. Link-graph functionality is
+derived from [ruslan2027/link-graph-explorer-oss](https://github.com/ruslan2027/link-graph-explorer-oss).
+See [LICENSE](LICENSE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and
+[licenses/link-graph-explorer-oss.LICENSE](licenses/link-graph-explorer-oss.LICENSE).
