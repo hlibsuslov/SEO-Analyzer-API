@@ -123,3 +123,35 @@ async def test_cancelled_waiter_does_not_leak_and_completed_work_is_cached() -> 
     assert analyzer._inflight == {}
     assert report.score.overall >= 90
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_shared_work_before_closing_clients() -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    settings = make_settings()
+    analyzer = Analyzer(settings, fetcher=make_fetcher(handler, settings=settings))
+    waiting = asyncio.create_task(analyzer.analyze("https://saas.test"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await analyzer.close()
+        assert stopped.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert analyzer._inflight == {}
+        assert not analyzer._cleanup_tasks
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        for task in list(analyzer._inflight.values()):
+            task.cancel()
+        await asyncio.gather(*list(analyzer._inflight.values()), return_exceptions=True)
+        await analyzer.close()

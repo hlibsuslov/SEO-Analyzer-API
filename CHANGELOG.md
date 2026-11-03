@@ -2,6 +2,32 @@
 
 All notable changes to this fork are documented here.
 
+## 2.0.1 — 2026-11-03
+
+### Changed
+
+- Refreshed runtime and development dependency minimums against current stable
+  PyPI releases; declared the directly imported Pydantic and Starlette dependencies.
+- Added Python 3.12 and 3.15 to CI, covering every supported minor from 3.11 to 3.15.
+- Updated the digest-pinned container base to Python 3.15.2, pinned CI actions by
+  commit, and added workflow cancellation and job timeouts.
+- CI now checks the installed wheel outside the checkout and starts the hardened
+  container to verify health, readiness, and third-party attribution files.
+- Updated Windows setup, timeout behavior, scan lifecycle, and contributor docs.
+
+### Fixed
+
+- Explicitly close SQLite connections after commit or rollback instead of waiting
+  for garbage collection; fail tests on resource warnings.
+- Keep explicit scan cancellations cancelled during service shutdown.
+- Validate scan ownership and publish results in one SQLite write transaction.
+- Enforce a total fetch deadline across DNS, queueing, redirects, and streaming.
+- Return structured `502` errors for interrupted, malformed, and timed-out response
+  streams while closing the upstream response.
+- Cancel and drain shared in-flight analyses before closing HTTP clients.
+- Include the project's and link-graph component's license notices when building
+  the wheel inside Docker.
+
 ## 2.0.0 — 2026-07-22
 
 ### Added

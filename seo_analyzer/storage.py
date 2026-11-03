@@ -2,6 +2,8 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +24,10 @@ class ScanStorage:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         if self._memory:
-            self._keeper = self.connect()
+            self._keeper = self._open_connection()
         self.init_schema()
 
-    def connect(self) -> sqlite3.Connection:
+    def _open_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self._dsn,
             check_same_thread=False,
@@ -36,6 +38,16 @@ class ScanStorage:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 10000")
         return conn
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back the transaction, then always close the connection."""
+        conn = self._open_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def close(self) -> None:
         if self._keeper is not None:
@@ -277,12 +289,14 @@ class ScanStorage:
             cursor = conn.execute(
                 """
                 UPDATE scans
-                SET status = 'pending', worker_id = NULL, heartbeat_at = NULL,
+                SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE 'pending' END,
+                    worker_id = NULL, heartbeat_at = NULL,
                     pages_crawled = 0, queued = 0, current_url = '',
-                    error = ?, finished_at = NULL
+                    error = CASE WHEN status = 'cancelling' THEN NULL ELSE ? END,
+                    finished_at = CASE WHEN status = 'cancelling' THEN ? ELSE NULL END
                 WHERE id = ? AND worker_id = ? AND status IN ('running', 'cancelling')
                 """,
-                (error, scan_id, worker_id),
+                (error, utc_now_iso(), scan_id, worker_id),
             )
         return cursor.rowcount == 1
 
@@ -361,6 +375,9 @@ class ScanStorage:
     ) -> bool:
         pages = result.get("crawl", {}).get("pages", {})
         with self._lock, self.connect() as conn:
+            # Ownership validation and publication must share a write transaction
+            # across API processes, including cancellation and lease recovery.
+            conn.execute("BEGIN IMMEDIATE")
             if worker_id:
                 owner = conn.execute(
                     "SELECT 1 FROM scans WHERE id = ? AND worker_id = ? AND status = 'running'",

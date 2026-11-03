@@ -17,6 +17,11 @@ Before every request, including redirects, the fetcher:
 
 Checking every DNS answer is intentionally conservative: a hostname with mixed public/private answers is rejected. Pinning the selected answer for the connection reduces time-of-check/time-of-use DNS-rebinding exposure.
 
+`SEO_FETCH_TIMEOUT_SECONDS` is an overall deadline covering DNS, concurrency
+queueing, all redirects, and response streaming. HTTPX's per-operation timeouts
+remain in place. A server sending occasional small chunks cannot keep a fetch
+running indefinitely. See [HTTPX timeout semantics](https://www.python-httpx.org/advanced/timeouts/).
+
 `SEO_ALLOW_PRIVATE_HOSTS=true` disables the central address boundary and should only be used in a trusted, isolated deployment with an explicit egress policy. Never enable it on a public multi-tenant endpoint.
 
 ## Crawl controls
@@ -50,6 +55,13 @@ SEO findings, graph data, and status/timing summaries in SQLite; raw HTML respon
 bodies are not intentionally persisted. Multi-worker deployments have independent
 caches and metrics, while scan ownership and cancellation are coordinated through
 SQLite worker leases.
+
+SQLite transaction scopes also explicitly close their connections; the standard
+connection context manager alone only commits or rolls back. Result publication
+acquires a write transaction before validating worker ownership, preventing a
+cancelled or replaced worker from overwriting the current scan. Explicitly
+cancelled scans are not requeued during graceful shutdown. See the
+[SQLite connection context manager](https://docs.python.org/3/library/sqlite3.html#how-to-use-the-connection-context-manager).
 
 ## Container posture
 

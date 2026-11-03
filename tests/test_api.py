@@ -5,6 +5,7 @@ import httpx
 from conftest import OPTIMIZED_HTML, make_fetcher, make_settings
 from fastapi.testclient import TestClient
 
+from seo_analyzer import __version__
 from seo_analyzer.analyzer import Analyzer
 from seo_analyzer.api import create_app
 
@@ -46,7 +47,7 @@ def test_operations_analysis_and_legacy_endpoints() -> None:
         with client:
             root = client.get("/")
             assert root.status_code == 200
-            assert root.json()["version"] == "2.0.0"
+            assert root.json()["version"] == __version__
             assert client.get("/healthz").json()["status"] == "ok"
             assert client.get("/readyz").json()["status"] == "ready"
             metrics = client.get("/metrics")

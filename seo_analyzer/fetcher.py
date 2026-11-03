@@ -113,11 +113,17 @@ class SafeFetcher:
             literal_address = ipaddress.ip_address(parsed.host)
         except ValueError:
             literal_address = None
-        addresses = (
-            [literal_address]
-            if literal_address is not None
-            else await self._resolver(parsed.host, port)
-        )
+        try:
+            async with asyncio.timeout(self.settings.fetch_timeout_seconds):
+                addresses = (
+                    [literal_address]
+                    if literal_address is not None
+                    else await self._resolver(parsed.host, port)
+                )
+        except TimeoutError as exc:
+            raise FetchError(
+                "dns_resolution_failed", "DNS resolution timed out", status_code=502
+            ) from exc
         if not addresses:
             raise FetchError(
                 "dns_resolution_failed", "The hostname did not resolve", status_code=502
@@ -136,6 +142,27 @@ class SafeFetcher:
         *,
         accepted_content_types: Collection[str] | None = ("text/html", "application/xhtml+xml"),
         max_bytes: int | None = None,
+    ) -> FetchResult:
+        try:
+            # HTTPX timeouts apply to individual I/O operations. This deadline
+            # also bounds DNS, queueing, redirects and continuously arriving data.
+            async with asyncio.timeout(self.settings.fetch_timeout_seconds):
+                return await self._fetch(
+                    url, accepted_content_types=accepted_content_types, max_bytes=max_bytes
+                )
+        except (TimeoutError, httpx.RequestError) as exc:
+            raise FetchError(
+                "upstream_unreachable",
+                "Upstream request timed out or the response could not be read",
+                status_code=502,
+            ) from exc
+
+    async def _fetch(
+        self,
+        url: str,
+        *,
+        accepted_content_types: Collection[str] | None,
+        max_bytes: int | None,
     ) -> FetchResult:
         limit = min(max_bytes or self.settings.max_response_bytes, self.settings.max_response_bytes)
         parsed_input, _ = await self.validate(url)
@@ -195,12 +222,7 @@ class SafeFetcher:
             extensions={"sni_hostname": public_url.host},
         )
         started_at = time.perf_counter()
-        try:
-            response = await self._client.send(request, stream=True)
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
-            raise FetchError(
-                "upstream_unreachable", f"Upstream request failed: {exc}", status_code=502
-            ) from exc
+        response = await self._client.send(request, stream=True)
         headers_at = time.perf_counter()
         try:
             declared_length = response.headers.get("content-length")
