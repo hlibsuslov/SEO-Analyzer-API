@@ -67,7 +67,8 @@ async def test_scan_manager_bounds_workers_and_requeues_on_shutdown(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_cancel_is_observed_across_managers(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("shutdown_owner", [False, True])
+async def test_cancel_is_observed_across_managers(tmp_path, monkeypatch, shutdown_owner) -> None:
     started = asyncio.Event()
 
     async def fake_crawl(*_args, should_cancel, **_kwargs):
@@ -88,6 +89,8 @@ async def test_cancel_is_observed_across_managers(tmp_path, monkeypatch) -> None
         scan = owner.create_and_start(project["id"], project["root_url"], UnifiedCrawlOptions())
         await asyncio.wait_for(started.wait(), timeout=1)
         assert peer.cancel(scan["id"]) is True
+        if shutdown_owner:
+            await owner.shutdown()
         for _ in range(100):
             if storage.get_scan(scan["id"])["status"] == "cancelled":
                 break

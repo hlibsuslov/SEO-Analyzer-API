@@ -1,3 +1,4 @@
+import asyncio
 import ipaddress
 
 import httpx
@@ -194,3 +195,79 @@ async def test_network_failure_and_empty_dns_are_normalized() -> None:
 @pytest.mark.asyncio
 async def test_static_resolver_handles_literal_ip() -> None:
     assert await SafeFetcher._resolve(PUBLIC_IP, 443) == [ipaddress.ip_address(PUBLIC_IP)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError, httpx.DecodingError],
+)
+async def test_stream_failures_are_normalized_and_closed(error_type) -> None:
+    class BrokenStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b"<html>"
+            raise error_type("broken response")
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = BrokenStream()
+    fetcher = make_fetcher(
+        lambda request: httpx.Response(200, headers={"content-type": "text/html"}, stream=stream)
+    )
+    try:
+        with pytest.raises(FetchError) as caught:
+            await fetcher.fetch("https://public.test")
+        assert caught.value.code == "upstream_unreachable"
+        assert caught.value.status_code == 502
+        assert stream.closed
+    finally:
+        await fetcher.close()
+
+
+@pytest.mark.asyncio
+async def test_total_deadline_stops_a_continuously_streaming_response() -> None:
+    class SlowStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.005)
+                yield b"x"
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = SlowStream()
+    settings = make_settings().model_copy(update={"fetch_timeout_seconds": 0.05})
+    fetcher = make_fetcher(
+        lambda request: httpx.Response(200, headers={"content-type": "text/html"}, stream=stream),
+        settings=settings,
+    )
+    try:
+        with pytest.raises(FetchError) as caught:
+            await asyncio.wait_for(fetcher.fetch("https://public.test"), timeout=1)
+        assert caught.value.code == "upstream_unreachable"
+        assert stream.closed
+    finally:
+        await fetcher.close()
+
+
+@pytest.mark.asyncio
+async def test_validation_has_a_dns_deadline() -> None:
+    async def stalled_resolver(_hostname, _port):
+        await asyncio.Event().wait()
+
+    settings = make_settings().model_copy(update={"fetch_timeout_seconds": 0.05})
+    fetcher = make_fetcher(
+        lambda request: httpx.Response(200), settings=settings, resolver=stalled_resolver
+    )
+    try:
+        with pytest.raises(FetchError) as caught:
+            await asyncio.wait_for(fetcher.validate("https://public.test"), timeout=1)
+        assert caught.value.code == "dns_resolution_failed"
+        assert caught.value.status_code == 502
+    finally:
+        await fetcher.close()

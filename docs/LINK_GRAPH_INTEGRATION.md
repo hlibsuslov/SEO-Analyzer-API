@@ -34,7 +34,9 @@ adds persistent link-graph scans on top of the existing safe asynchronous
 ## Limitations
 
 - Active work is executed in-process. Graceful shutdown immediately requeues it;
-  process crashes are recovered after `SEO_SCAN_JOB_LEASE_SECONDS`.
+  explicitly cancelled scans remain cancelled. Process crashes are recovered after
+  `SEO_SCAN_JOB_LEASE_SECONDS`. Result publication and worker ownership checks
+  share a SQLite write transaction.
 - External links are collected and visualized, but external targets are not fully
   crawled.
 - The dashboard is intentionally dependency-free and compact; deeper graph

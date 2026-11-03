@@ -38,6 +38,12 @@ Common statuses are:
 
 FastAPI validation errors use its standard `detail` array. Clients should branch on the HTTP status first and tolerate additional response fields.
 
+`SEO_FETCH_TIMEOUT_SECONDS` bounds the complete fetch, including DNS, waiting for
+a fetch slot, redirects, and streaming the body. Each standalone DNS validation is
+also bounded. A stalled DNS lookup returns `dns_resolution_failed`; an expired
+fetch deadline or an interrupted/malformed response returns `upstream_unreachable`
+with HTTP `502`. Client cancellation is propagated to the caller.
+
 ## `GET /v1/analyze`
 
 Audits one page.

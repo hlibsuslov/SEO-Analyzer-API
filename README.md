@@ -86,7 +86,7 @@ Interactive OpenAPI docs are available at `/docs` and `/redoc`.
 
 ## Quick start
 
-Python 3.11–3.14 is supported.
+Python 3.11–3.15 is supported. Use the latest patch release for your Python minor version.
 
 ```bash
 python -m venv .venv
@@ -94,6 +94,17 @@ python -m venv .venv
 python -m pip install -e '.[dev]'
 uvicorn main:app --reload
 ```
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m uvicorn seo_analyzer.api:app --reload
+```
+
+`seo_analyzer.api:app` also works when running an installed wheel outside the
+repository. `main:app` remains the repository's compatibility entry point.
 
 Analyze a page:
 
@@ -138,7 +149,7 @@ If `SEO_API_KEY` is set, add `-H 'X-API-Key: …'` to protected endpoints.
 
 ## Docker
 
-The image runs as a non-root user. The Compose example binds only to loopback,
+The image uses a digest-pinned Python 3.15.2 base and runs as a non-root user. The Compose example binds only to loopback,
 drops Linux capabilities, uses a read-only root filesystem, and persists SQLite
 in the `analyzer-data` volume mounted at `/data`.
 
@@ -154,7 +165,7 @@ All settings use the `SEO_` prefix. See [`.env.example`](.env.example) for the c
 | Variable | Default | Meaning |
 |---|---:|---|
 | `SEO_API_KEY` | empty | Optional `X-API-Key` shared secret |
-| `SEO_FETCH_TIMEOUT_SECONDS` | `12` | Upstream request timeout |
+| `SEO_FETCH_TIMEOUT_SECONDS` | `12` | Total fetch deadline, including DNS, concurrency queue, redirects, and response streaming |
 | `SEO_MAX_RESPONSE_BYTES` | `3000000` | Maximum decompressed page/resource body |
 | `SEO_MAX_REDIRECTS` | `5` | Redirect budget |
 | `SEO_MAX_CONCURRENT_FETCHES` | `8` | Process-wide fetch concurrency |
@@ -182,9 +193,15 @@ ruff format --check .
 mypy seo_analyzer
 pytest --cov --cov-report=term-missing
 pip-audit
+python -m build
 ```
 
 The suite covers URL security, DNS/redirect validation, parsing, page classification, issue scoring, sitemap/robots behavior, crawl aggregation, PageSpeed normalization, API compatibility, auth, and opportunity ranking.
+
+CI tests every Python minor version from 3.11 through 3.15, installs the built
+wheel outside the source tree, and starts the hardened container to check health,
+readiness, and bundled attribution files. Dependabot checks Python dependencies,
+pinned GitHub Actions, and the Docker base weekly.
 
 ## Scan data
 
@@ -192,7 +209,9 @@ SQLite stores projects, scans, normalized page URLs, stable graph node IDs,
 links with page zones, SEO reports, status/depth/timing metadata, and the complete
 versioned result snapshot. HTML response bodies are not persisted. Running scans
 write a worker lease and heartbeat; graceful shutdown requeues active work, while
-an abandoned lease is recovered automatically.
+an abandoned lease is recovered automatically. An explicit cancellation remains
+cancelled during shutdown. Result publication checks ownership in the same SQLite
+write transaction, and each database operation closes its connection explicitly.
 
 ## Known limitations
 

@@ -4,7 +4,7 @@ Contributions should keep the API explainable, safe for caller-controlled public
 
 ## Development setup
 
-Python 3.11 or newer is required.
+Python 3.11–3.15 is supported. Use a current patch release.
 
 ```bash
 python -m venv .venv
@@ -23,7 +23,10 @@ pip-audit
 python -m build
 ```
 
-`make check` runs lint, formatting, types and tests. The CI matrix validates Python 3.11 and 3.13, package installation and the container build.
+`make check` runs all six checks above. The CI matrix validates every Python minor
+version from 3.11 through 3.15. Separate jobs verify wheel installation outside the
+source tree, required license files, and health/readiness of the hardened container.
+Resource warnings fail tests so unclosed SQLite connections cannot silently regress.
 
 ## Change expectations
 

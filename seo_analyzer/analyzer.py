@@ -34,10 +34,23 @@ class Analyzer:
         self._inflight_lock = asyncio.Lock()
         self._inflight: dict[tuple[str, bool, bool], asyncio.Task[AnalysisArtifact]] = {}
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
 
     async def close(self) -> None:
-        await self.fetcher.close()
-        await self.pagespeed.close()
+        async with self._inflight_lock:
+            self._closed = True
+            tasks = list(self._inflight.values())
+            for task in tasks:
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Flush completion callbacks even when every task was already done.
+        await asyncio.sleep(0)
+        while self._cleanup_tasks:
+            cleanup = list(self._cleanup_tasks)
+            await asyncio.gather(*cleanup, return_exceptions=True)
+            self._cleanup_tasks.difference_update(cleanup)
+        await asyncio.gather(self.fetcher.close(), self.pagespeed.close())
 
     async def analyze(
         self,
@@ -60,6 +73,8 @@ class Analyzer:
         include_pagespeed: bool = False,
         include_subdomains: bool = False,
     ) -> AnalysisArtifact:
+        if self._closed:
+            raise RuntimeError("The analyzer is closed")
         parsed_url, _ = await self.fetcher.validate(url)
         key = (
             normalize_url(str(parsed_url), keep_query=True),
@@ -71,6 +86,8 @@ class Analyzer:
             return cached
 
         async with self._inflight_lock:
+            if self._closed:
+                raise RuntimeError("The analyzer is closed")
             task = self._inflight.get(key)
             if task is None:
                 task = asyncio.create_task(
